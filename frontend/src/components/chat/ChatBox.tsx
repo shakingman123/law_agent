@@ -64,6 +64,8 @@ export default function ChatBox() {
   const [previewOpen, setPreviewOpen] = useState(false);
   const [citationModal, setCitationModal] = useState<Citation | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const streamControllerRef = useRef<(() => void) | null>(null);
+  const streamBufferRef = useRef('');
 
   useEffect(() => {
     if (user) {
@@ -87,6 +89,12 @@ export default function ChatBox() {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages]);
+
+  useEffect(() => {
+    return () => {
+      streamControllerRef.current?.();
+    };
+  }, []);
 
   const handleUpload = async (file: File): Promise<void> => {
     try {
@@ -168,7 +176,7 @@ export default function ChatBox() {
       return;
     }
 
-    // 普通对话流程（/message）
+    // 普通对话流程（/stream SSE）
     const now = Date.now();
     const userMsg: ChatMessage = {
       id: -now,
@@ -195,31 +203,42 @@ export default function ChatBox() {
     setFileList([]);
     setSending(true);
 
-    try {
-      const res = await chatApi.sendMessage({
+    streamBufferRef.current = '';
+    streamControllerRef.current = chatApi.streamMessage(
+      {
         message: text,
         conversation_id: currentConversationId ?? undefined,
         attachments: sentAttachments,
         case_id: currentCase?.id,
         case_name: currentCase?.name,
         use_rag: true,
-      });
-      updateLastAgentMessage(
-        res.reply || res.error || '（无回复）',
-        res.rag_sources?.length ? res.rag_sources : undefined,
-        res.conversation_id,
-      );
-    } catch (err: unknown) {
-      const isTimeout =
-        (err as { code?: string; message?: string })?.code === 'ECONNABORTED' ||
-        /timeout/i.test((err as { message?: string })?.message || '');
-      const hint = isTimeout
-        ? '模型回复超时，请稍后重试（LLM 响应较慢）'
-        : '请求失败，请稍后重试';
-      updateLastAgentMessage(hint);
-    } finally {
-      setSending(false);
-    }
+      },
+      {
+        onMeta: (meta) => {
+          if (meta.rag_sources?.length) {
+            updateLastAgentMessage('', meta.rag_sources, meta.conversation_id);
+          } else if (meta.conversation_id) {
+            updateLastAgentMessage('', undefined, meta.conversation_id);
+          }
+        },
+        onToken: (token) => {
+          streamBufferRef.current += token;
+          updateLastAgentMessage(streamBufferRef.current);
+        },
+        onDone: (data) => {
+          updateLastAgentMessage(
+            streamBufferRef.current || '（无回复）',
+            undefined,
+            data.conversation_id,
+          );
+          setSending(false);
+        },
+        onError: (error) => {
+          updateLastAgentMessage(error);
+          setSending(false);
+        },
+      },
+    );
   };
 
   const placeholder = !llmReady

@@ -7,15 +7,22 @@
 LangGraph 的 interrupt 在 review 节点暂停，invoke 自动返回当前状态；
 通过 graph.get_state(config).next 判断是否仍在等待。
 """
+import asyncio
+import json
+import logging
 import uuid
+from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, logger
-from langchain_core.messages import HumanMessage, SystemMessage
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.deps import get_current_user
 from app.core.database import SessionLocal
 from app.models.user import User
+from app.models.conversation import Conversation, Message
 from app.agents.drafting import build_draft_graph
 from app.api.prompts import get_prompt
 from app.llm.gateway import gateway, QuotaExceeded
@@ -28,6 +35,8 @@ from app.schemas.chat import (
     ResumeRequest,
 )
 
+logger = logging.getLogger("app.api.chat")
+
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 
@@ -37,6 +46,45 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def _schedule_usage_record(
+    user_id: int,
+    cfg,
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+) -> None:
+    """Record usage asynchronously in an independent Session."""
+
+    async def _run() -> None:
+        db = SessionLocal()
+        try:
+            user = db.get(User, user_id)
+            if user:
+                gateway.record_usage(user, cfg, model, prompt_tokens, completion_tokens, db)
+        except Exception:  # noqa: BLE001
+            logger.warning("[chat_message] 用量记账失败，不影响对话回复", exc_info=True)
+        finally:
+            db.close()
+
+    asyncio.create_task(_run())
+
+
+_DEFAULT_SYSTEM_PROMPT = """你是一位专业的法律助手。请基于已知信息和知识库内容回答用户问题。
+输出格式要求：
+1. 先给结论，再展开说明，确保条理清晰；
+2. 使用 **加粗** 标注关键词和重点结论；
+3. 必要时使用层级标题组织内容（## 二级标题、### 三级标题）；
+4. 对比类信息用 Markdown 表格呈现；
+5. 引用参考资料时用 [序号] 标注（如 [1]、[2]），序号对应知识库参考资料编号；
+6. 使用有序或无序列表使要点清晰易读。
+{{context}}"""
+
+
+def _build_system_content(db: Session, context_block: str) -> str:
+    sys_tpl = get_prompt(db, "chat", "system") or _DEFAULT_SYSTEM_PROMPT
+    return sys_tpl.replace("{{context}}", context_block)
 
 
 def _build_response(thread_id: str, state: dict, graph, config) -> DraftResponse:
@@ -91,6 +139,14 @@ async def start_draft(
         result = await graph.ainvoke(initial_state, config=config)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"流程执行失败：{e}")
+
+    logger.info(
+        "[start_draft] 流程执行完成: thread_id=%s, draft_len=%d, draft_preview=%r, error=%r",
+        thread_id,
+        len(result.get("draft", "") or ""),
+        (result.get("draft", "") or "")[:80],
+        result.get("error", ""),
+    )
 
     return _build_response(thread_id, result, graph, config)
 
@@ -148,11 +204,6 @@ async def chat_message(
     - 截断的旧消息仍在 DB 与 UI 中可见，只是不进 LLM 上下文
     - LLM 未配置时仍存用户消息并返回 RAG 来源
     """
-    from datetime import datetime
-
-    from app.core.config import settings
-    from app.models.conversation import Conversation, Message
-
     # ① 解析/创建会话
     conv = None
     if payload.conversation_id:
@@ -273,12 +324,12 @@ async def chat_message(
         # 用量记账（失败不阻断对话回复）
         if resp.usage_metadata:
             try:
-                gateway.record_usage(
-                    user, cfg,
+                _schedule_usage_record(
+                    user.id,
+                    cfg,
                     llm.model_name,
                     resp.usage_metadata.get("input_tokens", 0),
                     resp.usage_metadata.get("output_tokens", 0),
-                    db,
                 )
             except Exception:  # noqa: BLE001
                 logger.warning("[chat_message] 用量记账失败，不影响对话回复", exc_info=True)
@@ -306,3 +357,159 @@ async def chat_message(
     except Exception as e:  # noqa: BLE001
         logger.exception("[chat_message] 对话调用失败: %s", e)
         raise HTTPException(status_code=500, detail=f"对话失败：{e}")
+
+
+
+
+def _sse_event(data: dict) -> str:
+    return "data: " + json.dumps(data) + "\n\n"
+
+
+@router.post("/stream")
+async def chat_stream(
+    payload: ChatMessageRequest,
+    user: User = Depends(get_current_user),
+):
+    """SSE 流式对话：streaming=True + llm.astream + asyncio.to_thread(retrieve)。"""
+
+    async def event_stream():
+        db = SessionLocal()
+        try:
+            # ① 解析/创建会话
+            conv = None
+            if payload.conversation_id:
+                conv = db.get(Conversation, payload.conversation_id)
+                if not conv or conv.user_id != user.id:
+                    yield _sse_event({"type": "error", "error": "会话不存在"})
+                    return
+            if conv is None:
+                conv = (
+                    db.query(Conversation)
+                    .filter_by(user_id=user.id)
+                    .order_by(Conversation.last_message_at.desc())
+                    .first()
+                )
+                if conv is None:
+                    conv = Conversation(user_id=user.id, title=payload.message[:20] or "新对话")
+                    db.add(conv)
+                    db.commit()
+                    db.refresh(conv)
+
+            # ② 存用户消息
+            user_msg = Message(
+                conversation_id=conv.id,
+                role="user",
+                content=payload.message,
+                attachments=[{"url": u} for u in payload.attachments],
+            )
+            db.add(user_msg)
+            if conv.title in ("新对话", "") and payload.message:
+                conv.title = payload.message[:20]
+            conv.last_message_at = datetime.utcnow()
+            db.commit()
+            db.refresh(user_msg)
+
+            # ③ RAG 检索（同步，放线程池）
+            rag_sources: list[dict] = []
+            context_block = ""
+            if payload.use_rag:
+                try:
+                    hits = await asyncio.to_thread(retrieve, payload.message)
+                    if hits:
+                        context_block = "\n\n【知识库参考资料】\n" + "\n---\n".join(
+                            f"[{i+1}] 来源：{h.get('source', '未知')}\n{h.get('content', '')}"
+                            for i, h in enumerate(hits)
+                        )
+                        rag_sources = [
+                            {
+                                "index": i + 1,
+                                "title": h.get("source", "未知来源"),
+                                "source": h.get("source", ""),
+                                "content": h.get("content", ""),
+                            }
+                            for i, h in enumerate(hits)
+                        ]
+                except Exception:  # noqa: BLE001
+                    logger.warning("[chat_stream] RAG 检索失败，忽略", exc_info=True)
+
+            # ④ 附件/案件提示
+            user_content = payload.message
+            if payload.attachments:
+                user_content += f"\n\n（用户已上传附件：{', '.join(payload.attachments)}）"
+            if payload.case_name:
+                user_content += f"\n（当前案件：{payload.case_name}）"
+
+            # ⑤ 取 streaming LLM
+            cfg = gateway.resolve_config(user, db)
+            llm = gateway.get_chat_model(user, db, temperature=0.4, streaming=True)
+
+            # ⑥ 历史
+            rounds = settings.CHAT_HISTORY_ROUNDS
+            history = (
+                db.query(Message)
+                .filter_by(conversation_id=conv.id)
+                .filter(Message.id < user_msg.id)
+                .order_by(Message.created_at.desc())
+                .limit(rounds * 2)
+                .all()
+            )
+            history.reverse()
+            history_msgs = []
+            for m in history:
+                if m.role == "user":
+                    history_msgs.append(HumanMessage(content=m.content))
+                else:
+                    history_msgs.append(AIMessage(content=m.content))
+
+            # ⑦ 系统提示词 + 消息列表
+            system_content = _build_system_content(db, context_block)
+            messages = [
+                SystemMessage(content=system_content),
+                *history_msgs,
+                HumanMessage(content=user_content),
+            ]
+
+            # ⑧ 先发 meta，再流式输出 token
+            yield _sse_event({
+                "type": "meta",
+                "conversation_id": conv.id,
+                "rag_sources": rag_sources,
+            })
+
+            full_parts: list[str] = []
+            async for chunk in llm.astream(messages):
+                token = getattr(chunk, "content", "") or ""
+                if isinstance(token, str) and token:
+                    full_parts.append(token)
+                    yield _sse_event({"type": "token", "content": token})
+
+            reply = "".join(full_parts)
+
+            # ⑨ 存 agent 回复
+            agent_msg = Message(
+                conversation_id=conv.id,
+                role="agent",
+                content=reply,
+                rag_sources=rag_sources,
+            )
+            db.add(agent_msg)
+            conv.last_message_at = datetime.utcnow()
+            db.commit()
+            db.refresh(agent_msg)
+
+            yield _sse_event({
+                "type": "done",
+                "message_id": agent_msg.id,
+                "conversation_id": conv.id,
+            })
+        except Exception as e:  # noqa: BLE001
+            logger.exception("[chat_stream] 流式对话失败: %s", e)
+            yield _sse_event({"type": "error", "error": str(e)})
+        finally:
+            db.close()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

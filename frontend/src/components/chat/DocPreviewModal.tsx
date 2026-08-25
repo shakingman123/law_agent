@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Modal, Button, Input, Typography, Spin, App } from 'antd';
 import {
   CheckOutlined,
@@ -46,10 +46,9 @@ export default function DocPreviewModal({
   const [fileUrl, setFileUrl] = useState('');
   const [pdfUrl, setPdfUrl] = useState('');
 
-  // result 变化时重置内部状态
-  const lastThreadId = useRef<string | null>(null);
-  if (result && result.thread_id !== lastThreadId.current) {
-    lastThreadId.current = result.thread_id;
+  // result 变化时同步内部草稿状态
+  useEffect(() => {
+    if (!result) return;
     setFeedback('');
     setSubmitting(false);
     setDraft(result.draft);
@@ -57,7 +56,7 @@ export default function DocPreviewModal({
     setDone(false);
     setFileUrl('');
     setPdfUrl('');
-  }
+  }, [result?.thread_id, result?.draft]);
 
   const handleResume = async (confirmed: boolean) => {
     if (!result) return;
@@ -130,7 +129,7 @@ export default function DocPreviewModal({
             color: '#000',
           }}
         >
-          {draft || '（草稿生成中...）'}
+          {draft || result?.draft || '（草稿生成中...）'}
         </div>
       </div>
 

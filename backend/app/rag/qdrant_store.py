@@ -61,10 +61,10 @@ def _get_client():
     try:
         from qdrant_client import QdrantClient
 
-        client = QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY or None)
+        client = QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY or None, timeout=settings.QDRANT_TIMEOUT)
         client.get_collections()  # 连接探测
         _qdrant_client = client
-        logger.info("[qdrant] 客户端已连接: %s", settings.QDRANT_URL)
+        logger.info("[qdrant] 客户端已连接: %s, timeout=%s", settings.QDRANT_URL, settings.QDRANT_TIMEOUT)
         return client
     except Exception as e:  # noqa: BLE001
         logger.warning("[qdrant] 连接失败，将回退 ChromaDB: %s", e)

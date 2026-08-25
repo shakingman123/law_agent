@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     # LLM API Key 加密密钥（Fernet；非法时自动派生，仅开发环境安全）
     LLM_ENCRYPTION_KEY: str = "replace-with-fernet-key-please"
+    # LLM 调用超时（秒）与最大重试次数
+    # 默认 120s 与前端 chat.ts 的 LLM_TIMEOUT 对齐，避免文书撰写（draft_node 润色长文本）超时
+    LLM_TIMEOUT: float = 120.0
+    LLM_MAX_RETRIES: int = 2
     # CORS 允许来源（逗号分隔）
     CORS_ORIGINS: str = "http://localhost:5173"
     # 文件上传目录（开发环境本地磁盘）
@@ -20,6 +24,8 @@ class Settings(BaseSettings):
     # Qdrant 向量库（法律检索多源 RAG）
     QDRANT_URL: str = "http://localhost:6333"
     QDRANT_API_KEY: str = ""
+    # Qdrant 客户端超时（秒）
+    QDRANT_TIMEOUT: float = 5.0
     # Qdrant 集合名
     QDRANT_COLLECTION_LAW: str = "law_articles"          # 法条库
     QDRANT_COLLECTION_CASE: str = "case_precedents"      # 判例库（公司脱敏案例）
@@ -27,7 +33,7 @@ class Settings(BaseSettings):
     # RAG 检索默认返回条数
     RAG_TOP_K: int = 5
     # 对话上下文：拼进 LLM 的最近消息轮数（1 轮 = 1 条 user + 1 条 agent）
-    CHAT_HISTORY_ROUNDS: int = 10
+    CHAT_HISTORY_ROUNDS: int = 5
     # ClamAV 病毒扫描（留空则使用 TCP；填写路径则用 Unix socket）
     CLAMAV_SOCKET: str = ""
     CLAMAV_HOST: str = "localhost"

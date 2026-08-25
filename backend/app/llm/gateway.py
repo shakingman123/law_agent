@@ -15,6 +15,7 @@ from typing import Optional
 from langchain_openai import ChatOpenAI
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.security import decrypt_api_key, mask_api_key
 from app.models.llm import (
     CompanyLlmConfig,
@@ -44,14 +45,15 @@ class ResolvedConfig:
 
 # 平台开发者 Key（仅开发兜底，生产环境应留空以强制使用公司/个人配置）
 PLATFORM_LLM_KEY = os.getenv("PLATFORM_LLM_API_KEY", "")
-PLATFORM_LLM_BASE = os.getenv("PLATFORM_LLM_BASE_URL", "https://api.openai.com/v1")
-PLATFORM_LLM_MODEL = os.getenv("PLATFORM_LLM_MODEL", "gpt-4o-mini")
+PLATFORM_LLM_BASE = os.getenv("PLATFORM_LLM_BASE_URL", "https://api.deepseek.com/v1")
+PLATFORM_LLM_MODEL = os.getenv("PLATFORM_LLM_MODEL", "deepseek-chat")
 
 # OpenAI 标准计费（$/1M tokens），仅用于用量估算，实际以服务商账单为准
 _PRICE_TABLE = {
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4o": (2.50, 10.00),
     "deepseek-chat": (0.14, 0.28),
+    "deepseek-reasoner": (0.55, 2.19),
 }
 
 
@@ -131,7 +133,7 @@ class LLMGateway:
             )
             return ResolvedConfig(
                 source="platform",
-                provider="openai",
+                provider="deepseek",
                 base_url=PLATFORM_LLM_BASE,
                 api_key=PLATFORM_LLM_KEY,
                 models=[PLATFORM_LLM_MODEL],
@@ -175,6 +177,8 @@ class LLMGateway:
             base_url=cfg.base_url or None,
             temperature=temperature,
             streaming=streaming,
+            request_timeout=settings.LLM_TIMEOUT,
+            max_retries=settings.LLM_MAX_RETRIES,
         )
 
     def enforce_quota(self, user: User, cfg: ResolvedConfig, db: Session) -> None:

@@ -132,6 +132,7 @@ def build_draft_graph(user: User, db: Session):
     通过 LLMGateway 取 ChatModel（不直接接触 Key）。
     """
     logger.info("[build_draft_graph] 构造图实例: user_id=%s", user.id)
+    cfg = gateway.resolve_config(user, db)
     llm = gateway.get_chat_model(user, db, temperature=0.4)
     logger.info("[build_draft_graph] ChatModel 就绪: model=%s", llm.model_name)
 
@@ -162,7 +163,7 @@ def build_draft_graph(user: User, db: Session):
             # 用量记账
             if resp.usage_metadata:
                 gateway.record_usage(
-                    user, gateway.resolve_config(user, db),
+                    user, cfg,
                     llm.model_name,
                     resp.usage_metadata.get("input_tokens", 0),
                     resp.usage_metadata.get("output_tokens", 0),
@@ -267,7 +268,7 @@ def build_draft_graph(user: User, db: Session):
             )
             if resp.usage_metadata:
                 gateway.record_usage(
-                    user, gateway.resolve_config(user, db),
+                    user, cfg,
                     llm.model_name,
                     resp.usage_metadata.get("input_tokens", 0),
                     resp.usage_metadata.get("output_tokens", 0),
@@ -315,7 +316,7 @@ def build_draft_graph(user: User, db: Session):
                 )
                 if resp.usage_metadata:
                     gateway.record_usage(
-                        user, gateway.resolve_config(user, db),
+                        user, cfg,
                         llm.model_name,
                         resp.usage_metadata.get("input_tokens", 0),
                         resp.usage_metadata.get("output_tokens", 0),
@@ -355,7 +356,7 @@ def build_draft_graph(user: User, db: Session):
             )
             if resp.usage_metadata:
                 gateway.record_usage(
-                    user, gateway.resolve_config(user, db),
+                    user, cfg,
                     llm.model_name,
                     resp.usage_metadata.get("input_tokens", 0),
                     resp.usage_metadata.get("output_tokens", 0),
