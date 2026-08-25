@@ -1,0 +1,27 @@
+fastapi[standard]
+uvicorn
+sqlalchemy
+alembic
+pydantic-settings
+python-jose
+passlib[bcrypt]
+python-multipart
+cryptography
+# Agent 编排（依据 docs/implementation-guide.md 阶段 3）
+langchain
+langchain-openai
+langgraph
+langchain-community
+langchain-text-splitters
+# LangGraph 检查点持久化（按 CHECKPOINTER_TYPE 选择安装）
+langgraph-checkpoint-sqlite
+langgraph-checkpoint-postgres
+# RAG 知识库（本地向量库 + 文档解析）
+chromadb
+python-docx
+pdfplumber
+# 案件归档（病毒扫描 + 加密存储）
+clamd
+minio
+# 法律检索向量库（Qdrant）
+qdrant-client
