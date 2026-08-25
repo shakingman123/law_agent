@@ -79,6 +79,31 @@ class CompanyAdminStatus(BaseModel):
     admin_name: Optional[str] = None
 
 
+class InviteCodeOut(BaseModel):
+    """公司邀请码。"""
+    company_id: int
+    company_name: str
+    invite_code: Optional[str] = None
+
+
+class JoinRequestIn(BaseModel):
+    """员工凭邀请码申请加入公司。"""
+    invite_code: str
+
+
+class JoinRequestOut(BaseModel):
+    """员工加入公司申请记录。"""
+    id: int
+    user_id: int
+    user_name: str
+    user_email: str
+    company_id: int
+    company_name: str
+    status: str  # pending / approved / rejected
+    created_at: datetime
+    reviewed_at: Optional[datetime] = None
+
+
 # ---------------- 辅助 ----------------
 def _gen_invite_code(length: int = 8) -> str:
     alphabet = string.ascii_uppercase + string.digits
@@ -242,3 +267,168 @@ def get_my_admin_request(
         if r["user_id"] == user.id:
             return AdminRequestOut(**r)
     return None
+
+
+# ---------------- 邀请码 / 员工加入 ----------------
+# 员工加入申请的内存存储（后续可迁移到数据库表）
+_join_requests: list[dict] = []
+_join_req_counter = {"n": 0}
+
+
+def _require_company_admin(user: User, db: Session) -> Company:
+    """校验当前用户是某公司的管理员，返回该公司。"""
+    if not user.is_admin or not user.company_id:
+        raise HTTPException(status_code=403, detail="仅公司管理员可执行此操作")
+    company = db.get(Company, user.company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="公司不存在")
+    if company.admin_id != user.id:
+        raise HTTPException(status_code=403, detail="仅公司管理员可执行此操作")
+    return company
+
+
+@router.get("/company/invite-code", response_model=InviteCodeOut)
+def get_company_invite_code(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """管理员获取本公司的当前邀请码（若不存在则自动生成）。"""
+    company = _require_company_admin(user, db)
+    if not company.invite_code:
+        company.invite_code = _gen_invite_code()
+        db.commit()
+    return InviteCodeOut(
+        company_id=company.id,
+        company_name=company.name,
+        invite_code=company.invite_code,
+    )
+
+
+@router.post("/company/invite-code/regenerate", response_model=InviteCodeOut)
+def regenerate_company_invite_code(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """管理员重新生成邀请码（旧码立即失效）。"""
+    company = _require_company_admin(user, db)
+    company.invite_code = _gen_invite_code()
+    db.commit()
+    return InviteCodeOut(
+        company_id=company.id,
+        company_name=company.name,
+        invite_code=company.invite_code,
+    )
+
+
+@router.post("/company/join", response_model=JoinRequestOut)
+def apply_join_company(
+    payload: JoinRequestIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """员工凭邀请码申请加入公司，等待管理员审批。
+
+    条件：
+    - 邀请码能匹配到某公司
+    - 用户非管理员
+    - 无重复 pending 申请
+    """
+    if user.is_admin:
+        raise HTTPException(status_code=400, detail="管理员无需申请加入公司")
+
+    company = (
+        db.query(Company).filter(Company.invite_code == payload.invite_code).first()
+    )
+    if not company:
+        raise HTTPException(status_code=404, detail="邀请码无效或已失效")
+
+    # 已在同公司则无需重复申请
+    if user.company_id == company.id:
+        raise HTTPException(status_code=400, detail="您已加入该公司")
+
+    # 查重：同一用户对同一公司已有 pending 申请
+    for r in _join_requests:
+        if (
+            r["user_id"] == user.id
+            and r["company_id"] == company.id
+            and r["status"] == "pending"
+        ):
+            raise HTTPException(status_code=400, detail="已有待审批的加入申请")
+
+    _join_req_counter["n"] += 1
+    req = {
+        "id": _join_req_counter["n"],
+        "user_id": user.id,
+        "user_name": user.name,
+        "user_email": user.email,
+        "company_id": company.id,
+        "company_name": company.name,
+        "status": "pending",
+        "created_at": datetime.utcnow(),
+        "reviewed_at": None,
+    }
+    _join_requests.append(req)
+    return JoinRequestOut(**req)
+
+
+@router.get("/company/join-requests", response_model=list[JoinRequestOut])
+def list_company_join_requests(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """管理员查询本公司的待审批加入申请列表。"""
+    company = _require_company_admin(user, db)
+    return [
+        JoinRequestOut(**r)
+        for r in _join_requests
+        if r["company_id"] == company.id
+    ]
+
+
+@router.post("/company/join-requests/{req_id}/approve", response_model=JoinRequestOut)
+def approve_join_request(
+    req_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """管理员批准员工加入申请，将员工加入公司。"""
+    company = _require_company_admin(user, db)
+    req = next((r for r in _join_requests if r["id"] == req_id), None)
+    if not req:
+        raise HTTPException(status_code=404, detail="加入申请不存在")
+    if req["company_id"] != company.id:
+        raise HTTPException(status_code=403, detail="无权审批该公司申请")
+    if req["status"] != "pending":
+        raise HTTPException(status_code=400, detail="该申请已处理")
+
+    applicant = db.get(User, req["user_id"])
+    if not applicant:
+        raise HTTPException(status_code=404, detail="申请用户不存在")
+    # 若员工已在其他公司，批准后将转移至本公司
+    applicant.company_id = company.id
+    applicant.is_admin = False
+    req["status"] = "approved"
+    req["reviewed_at"] = datetime.utcnow()
+    db.commit()
+    return JoinRequestOut(**req)
+
+
+@router.post("/company/join-requests/{req_id}/reject", response_model=JoinRequestOut)
+def reject_join_request(
+    req_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """管理员拒绝员工加入申请。"""
+    company = _require_company_admin(user, db)
+    req = next((r for r in _join_requests if r["id"] == req_id), None)
+    if not req:
+        raise HTTPException(status_code=404, detail="加入申请不存在")
+    if req["company_id"] != company.id:
+        raise HTTPException(status_code=403, detail="无权审批该公司申请")
+    if req["status"] != "pending":
+        raise HTTPException(status_code=400, detail="该申请已处理")
+
+    req["status"] = "rejected"
+    req["reviewed_at"] = datetime.utcnow()
+    return JoinRequestOut(**req)

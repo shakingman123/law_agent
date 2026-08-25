@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Card,
   Form,
@@ -16,13 +16,16 @@ import {
   Tag,
   Alert,
   Modal,
+  List,
+  Tooltip,
+  message as staticMessage,
 } from 'antd';
-import { UserOutlined, BgColorsOutlined, HomeOutlined, ApiOutlined, UploadOutlined, CrownOutlined, LogoutOutlined } from '@ant-design/icons';
+import { UserOutlined, BgColorsOutlined, HomeOutlined, ApiOutlined, UploadOutlined, CrownOutlined, LogoutOutlined, CopyOutlined, ReloadOutlined, TeamOutlined, CheckOutlined, CloseOutlined } from '@ant-design/icons';
 import type { UploadFile } from 'antd';
 import { useAuthStore } from '../../stores/authStore';
 import { colors } from '../../theme/tokens';
 import LlmApiPanel from '../../components/settings/LlmApiPanel';
-import { authApi } from '../../api/auth';
+import { authApi, type InviteCode, type JoinRequest } from '../../api/auth';
 import { useNavigate } from 'react-router-dom';
 
 type Section = 'basic' | 'interface' | 'company' | 'llm';
@@ -63,6 +66,109 @@ export default function Settings() {
     adminName?: string;
     notFound?: boolean;
   }>({ loading: false });
+
+  // 邀请码管理（管理员）
+  const [inviteCodeInfo, setInviteCodeInfo] = useState<InviteCode | null>(null);
+  const [inviteLoading, setInviteLoading] = useState(false);
+  const [regenerating, setRegenerating] = useState(false);
+
+  // 待审批加入申请（管理员）
+  const [joinRequests, setJoinRequests] = useState<JoinRequest[]>([]);
+  const [joinReqLoading, setJoinReqLoading] = useState(false);
+  const [reviewingId, setReviewingId] = useState<number | null>(null);
+
+  // 员工申请加入
+  const [submittingJoin, setSubmittingJoin] = useState(false);
+
+  // 管理员进入公司 tab 时加载邀请码与加入申请
+  const loadCompanyAdminData = async () => {
+    if (!user?.isAdmin || !user?.companyId) return;
+    setInviteLoading(true);
+    setJoinReqLoading(true);
+    try {
+      const [code, reqs] = await Promise.all([
+        authApi.getInviteCode().catch(() => null),
+        authApi.listJoinRequests().catch(() => [] as JoinRequest[]),
+      ]);
+      if (code) setInviteCodeInfo(code);
+      setJoinRequests(reqs);
+    } finally {
+      setInviteLoading(false);
+      setJoinReqLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (section === 'company') {
+      loadCompanyAdminData();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [section, user?.isAdmin, user?.companyId]);
+
+  const handleCopyCode = async (code: string) => {
+    try {
+      await navigator.clipboard.writeText(code);
+      message.success('邀请码已复制到剪贴板');
+    } catch {
+      staticMessage.warning('复制失败，请手动选择复制');
+    }
+  };
+
+  const handleRegenerate = async () => {
+    setRegenerating(true);
+    try {
+      const res = await authApi.regenerateInviteCode();
+      setInviteCodeInfo(res);
+      message.success('已重新生成邀请码，旧码已失效');
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '生成失败');
+    } finally {
+      setRegenerating(false);
+    }
+  };
+
+  const handleApprove = async (reqId: number) => {
+    setReviewingId(reqId);
+    try {
+      await authApi.approveJoinRequest(reqId);
+      message.success('已批准加入申请');
+      setJoinRequests((prev) => prev.filter((r) => r.id !== reqId));
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '操作失败');
+    } finally {
+      setReviewingId(null);
+    }
+  };
+
+  const handleReject = async (reqId: number) => {
+    setReviewingId(reqId);
+    try {
+      await authApi.rejectJoinRequest(reqId);
+      message.success('已拒绝加入申请');
+      setJoinRequests((prev) => prev.filter((r) => r.id !== reqId));
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '操作失败');
+    } finally {
+      setReviewingId(null);
+    }
+  };
+
+  const handleApplyJoin = async () => {
+    if (!inviteCode.trim()) {
+      message.error('请输入邀请码');
+      return;
+    }
+    setSubmittingJoin(true);
+    try {
+      await authApi.applyJoinCompany(inviteCode.trim());
+      message.success('申请已提交，等待该公司管理员审批');
+      setInviteCode('');
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '申请失败');
+    } finally {
+      setSubmittingJoin(false);
+    }
+  };
 
   const handleCheckCompany = async () => {
     if (!applyCompanyName.trim()) {
@@ -315,33 +421,149 @@ export default function Settings() {
 
                 <Divider />
 
-                {/* 块二：加入新公司 */}
-                <Typography.Title level={5}>加入新公司</Typography.Title>
-                <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
-                  填入公司管理者发送的邀请码，申请加入
-                </Typography.Text>
-                <Space.Compact style={{ width: '100%', marginBottom: 8 }}>
-                  <Input
-                    placeholder="请输入邀请码"
-                    value={inviteCode}
-                    onChange={(e) => setInviteCode(e.target.value)}
-                  />
-                  <Button
-                    type="primary"
-                    onClick={() => {
-                      if (!inviteCode) {
-                        message.error('请输入邀请码');
-                        return;
-                      }
-                      message.success('申请已提交，等待管理者审核');
-                      setInviteCode('');
-                    }}
-                  >
-                    申请加入
-                  </Button>
-                </Space.Compact>
+                {/* 块二（管理员）：邀请码管理 */}
+                {user.isAdmin && !!user.companyId && (
+                  <>
+                    <Typography.Title level={5}>
+                      <CrownOutlined style={{ marginRight: 6, color: colors.primary }} />
+                      邀请码管理
+                    </Typography.Title>
+                    <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
+                      生成随机邀请码后分享给员工，员工填入邀请码申请加入，经您审批后即可加入公司。
+                    </Typography.Text>
+                    <Card size="small" loading={inviteLoading} style={{ marginBottom: 12 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                          <Typography.Text type="secondary" style={{ flexShrink: 0 }}>当前邀请码</Typography.Text>
+                          {inviteCodeInfo?.invite_code ? (
+                            <Typography.Text
+                              copyable={false}
+                              style={{
+                                fontFamily: 'monospace',
+                                fontSize: 18,
+                                fontWeight: 600,
+                                letterSpacing: 2,
+                                color: colors.primary,
+                              }}
+                            >
+                              {inviteCodeInfo.invite_code}
+                            </Typography.Text>
+                          ) : (
+                            <Typography.Text type="secondary">—</Typography.Text>
+                          )}
+                        </div>
+                        <Space>
+                          <Tooltip title="复制邀请码">
+                            <Button
+                              icon={<CopyOutlined />}
+                              disabled={!inviteCodeInfo?.invite_code}
+                              onClick={() => inviteCodeInfo?.invite_code && handleCopyCode(inviteCodeInfo.invite_code)}
+                            >
+                              复制
+                            </Button>
+                          </Tooltip>
+                          <Tooltip title="重新生成，旧码立即失效">
+                            <Button
+                              icon={<ReloadOutlined />}
+                              loading={regenerating}
+                              onClick={handleRegenerate}
+                            >
+                              重新生成
+                            </Button>
+                          </Tooltip>
+                        </Space>
+                      </div>
+                    </Card>
+                    <Alert
+                      type="warning"
+                      showIcon
+                      message="重新生成邀请码后，旧邀请码将立即失效"
+                      description="请将最新邀请码发送给需加入公司的员工，员工在「加入新公司」处填写即可申请。"
+                      style={{ marginBottom: 16 }}
+                    />
 
-                <Divider />
+                    <Divider />
+
+                    {/* 块三（管理员）：待审批加入申请 */}
+                    <Typography.Title level={5}>
+                      <TeamOutlined style={{ marginRight: 6, color: colors.primary }} />
+                      待审批加入申请
+                    </Typography.Title>
+                    <List
+                      loading={joinReqLoading}
+                      dataSource={joinRequests.filter((r) => r.status === 'pending')}
+                      locale={{ emptyText: '暂无待审批的加入申请' }}
+                      renderItem={(req) => (
+                        <List.Item
+                          actions={[
+                            <Button
+                              key="approve"
+                              type="primary"
+                              size="small"
+                              icon={<CheckOutlined />}
+                              loading={reviewingId === req.id}
+                              onClick={() => handleApprove(req.id)}
+                            >
+                              批准
+                            </Button>,
+                            <Button
+                              key="reject"
+                              danger
+                              size="small"
+                              icon={<CloseOutlined />}
+                              loading={reviewingId === req.id}
+                              onClick={() => handleReject(req.id)}
+                            >
+                              拒绝
+                            </Button>,
+                          ]}
+                        >
+                          <List.Item.Meta
+                            title={
+                              <Space>
+                                <Typography.Text strong>{req.user_name}</Typography.Text>
+                                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                                  {req.user_email}
+                                </Typography.Text>
+                              </Space>
+                            }
+                            description={`申请加入 · ${new Date(req.created_at).toLocaleString()}`}
+                          />
+                        </List.Item>
+                      )}
+                      style={{ marginBottom: 16 }}
+                    />
+
+                    <Divider />
+                  </>
+                )}
+
+                {/* 块四：加入新公司（非管理员） */}
+                {!user.isAdmin && (
+                  <>
+                    <Typography.Title level={5}>加入新公司</Typography.Title>
+                    <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
+                      填入公司管理者发送的邀请码，申请加入
+                    </Typography.Text>
+                    <Space.Compact style={{ width: '100%', marginBottom: 8 }}>
+                      <Input
+                        placeholder="请输入邀请码"
+                        value={inviteCode}
+                        onChange={(e) => setInviteCode(e.target.value)}
+                        onPressEnter={handleApplyJoin}
+                      />
+                      <Button
+                        type="primary"
+                        loading={submittingJoin}
+                        onClick={handleApplyJoin}
+                      >
+                        申请加入
+                      </Button>
+                    </Space.Compact>
+
+                    <Divider />
+                  </>
+                )}
 
                 {/* 块三：成为公司管理员 */}
                 <Typography.Title level={5}>

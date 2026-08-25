@@ -41,6 +41,8 @@ class CompanyLlmConfigPublic(BaseModel):
     is_active: bool
     api_key_masked: str
     provider: Optional[Provider] = None
+    # 员工 UI 需展示"可用模型"，故一并返回（不含敏感信息）
+    models: list[str] = []
 
 
 # ---------------- 个人配置 ----------------

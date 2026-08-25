@@ -111,6 +111,7 @@ def get_company_config(
         is_active=cfg.is_active,
         api_key_masked=masked,
         provider=cfg.provider,
+        models=cfg.models or [],
     )
 
 

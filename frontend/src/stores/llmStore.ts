@@ -106,10 +106,11 @@ interface LlmState {
 const mapCompany = (c: ApiCompanyConfig): CompanyLlmConfig => ({
   isActive: c.is_active,
   provider: c.provider,
-  baseUrl: c.base_url,
-  apiKeyMasked: c.api_key_masked,
-  models: c.models,
-  monthlyBudget: c.monthly_budget,
+  baseUrl: c.base_url ?? '',
+  apiKeyMasked: c.api_key_masked ?? '',
+  // 员工视角后端可能不返回 models/base_url/monthly_budget，需兜底防 undefined
+  models: c.models ?? [],
+  monthlyBudget: c.monthly_budget ?? 0,
 });
 
 const mapPersonal = (c: ApiPersonalConfig): PersonalLlmConfig => ({
