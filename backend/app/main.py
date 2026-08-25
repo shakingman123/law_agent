@@ -18,7 +18,7 @@ logging.basicConfig(
 )
 
 
-from app.api import auth, cases, chat, conversations, files, llm, prompts, rag, templates
+from app.api import auth, cases, chat, conversations, files, llm, prompts, rag, schedules, templates
 from app.core.config import settings
 from app.core.database import Base, engine, SessionLocal
 
@@ -53,6 +53,7 @@ app.include_router(rag.router)
 app.include_router(files.router)
 app.include_router(conversations.router)
 app.include_router(templates.router)
+app.include_router(schedules.router)
 
 
 @app.get("/")

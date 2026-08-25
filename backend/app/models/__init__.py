@@ -9,6 +9,7 @@ from app.models.llm import (
     UserLlmConfig,
 )
 from app.models.prompt import PromptTemplate
+from app.models.schedule import Schedule
 from app.models.template import DocumentTemplate
 from app.models.user import Company, User
 
@@ -27,4 +28,5 @@ __all__ = [
     "Conversation",
     "Message",
     "DocumentTemplate",
+    "Schedule",
 ]
