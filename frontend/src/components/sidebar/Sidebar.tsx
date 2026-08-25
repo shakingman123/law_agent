@@ -52,7 +52,7 @@ export default function Sidebar() {
           color: colors.primary,
         }}
       >
-        法律文书 Agent
+        律治天下 Agent
       </div>
       <Menu
         mode="inline"
