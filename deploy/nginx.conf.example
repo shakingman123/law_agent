@@ -1,0 +1,106 @@
+# Nginx 配置模板 — 法律文书 Agent
+# ============================================================================
+# 用法：
+#   1. 复制为实际站点配置：sudo cp nginx.conf.example /etc/nginx/sites-available/law-agent
+#   2. 修改下方 YOUR_DOMAIN、SSL 路径、前端 dist 路径
+#   3. sudo ln -s /etc/nginx/sites-available/law-agent /etc/nginx/sites-enabled/
+#   4. sudo nginx -t && sudo systemctl reload nginx
+#
+# 推荐先跑 HTTP（80），用 certbot 签发证书后自动改为 HTTPS：
+#   sudo certbot --nginx -d YOUR_DOMAIN
+# ============================================================================
+
+# 后端 uvicorn 上游（如需多实例负载均衡，在此添加多个 server）
+upstream law_agent_backend {
+    server 127.0.0.1:8000;
+    # 如部署多副本：server 127.0.0.1:8001; ...
+    keepalive 32;
+}
+
+# HTTP → HTTPS 跳转（启用 HTTPS 后取消注释）
+server {
+    listen 80;
+    server_name YOUR_DOMAIN;          # ← 改成你的域名或 IP
+
+    # certbot 验证用，保留在 80 端口
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name YOUR_DOMAIN;          # ← 改成你的域名
+
+    # ---- SSL 证书（certbot 签发后会自动填充，或手动指定） ----
+    ssl_certificate     /etc/letsencrypt/live/YOUR_DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/YOUR_DOMAIN/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_session_cache shared:SSL:10m;
+
+    # ---- 前端静态资源 ----
+    root /opt/law_agent/frontend/dist;   # ← 改成你的 dist 实际路径
+    index index.html;
+
+    # 上传文件体积限制（文书/证据附件可能较大）
+    client_max_body_size 50m;
+
+    # gzip 压缩，加速前端资源
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml image/svg+xml;
+    gzip_min_length 1024;
+
+    # ---- 前端 SPA：刷新回退到 index.html（React Router hash 模式下也兼容） ----
+    location / {
+        try_files $uri $uri/ /index.html;
+        # 静态资源带指纹缓存一年（Vite 构建产物文件名含 hash）
+        location ~* \.(?:js|css|woff2?|png|jpe?g|gif|svg|ico)$ {
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+        }
+    }
+
+    # ---- 后端 REST API 反代 ----
+    # 前端 baseURL 默认 /api，所有业务接口走此前缀
+    location /api/ {
+        proxy_pass http://law_agent_backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # LLM 响应较慢（撰写文书可达数十秒），必须放宽读写超时
+        # 与后端 settings.LLM_TIMEOUT（默认 120s）对齐
+        proxy_connect_timeout 10s;
+        proxy_send_timeout 130s;
+        proxy_read_timeout 130s;
+
+        # SSE/流式输出禁用缓冲，保证 token 实时到达前端
+        proxy_buffering off;
+    }
+
+    # ---- WebSocket 反代（流式对话 / 提醒推送，预留通道） ----
+    location /ws/ {
+        proxy_pass http://law_agent_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+
+        # 长连接保活
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    # 健康检查（可选）
+    location = /api/health {
+        access_log off;
+        proxy_pass http://law_agent_backend/api/health;
+    }
+}
