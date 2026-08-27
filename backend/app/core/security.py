@@ -13,13 +13,27 @@ from app.core.config import settings
 # ---- 密码哈希（passlib bcrypt）----
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+# bcrypt 算法硬限制：输入最长 72 字节（UTF-8 下一个汉字占 3 字节，即约 24 个汉字）
+# 新版 bcrypt 超限直接抛 ValueError 导致 500，故统一按字节安全截断后再哈希/校验，
+# 保证哈希与校验使用同一截断逻辑、互相一致。
+_BCRYPT_MAX_BYTES = 72
+
+
+def _bcrypt_safe(password: str) -> str:
+    """将密码截断到 UTF-8 编码不超过 72 字节（按整字符截断，不切半个字）。"""
+    if len(password.encode("utf-8")) <= _BCRYPT_MAX_BYTES:
+        return password
+    while len(password.encode("utf-8")) > _BCRYPT_MAX_BYTES:
+        password = password[:-1]
+    return password
+
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    return pwd_context.hash(_bcrypt_safe(password))
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    return pwd_context.verify(_bcrypt_safe(plain), hashed)
 
 
 # ---- JWT（python-jose）----

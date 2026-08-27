@@ -108,7 +108,22 @@ export default function UserCard() {
                     <Form.Item name="email" label="邮箱" rules={[{ required: true }]}>
                       <Input placeholder="you@example.com" />
                     </Form.Item>
-                    <Form.Item name="password" label="密码" rules={[{ required: true }]}>
+                    <Form.Item
+                      name="password"
+                      label="密码"
+                      extra="不超过 72 字节（一个汉字占 3 字节，约 24 个汉字 / 72 个英文字符）"
+                      rules={[
+                        { required: true },
+                        {
+                          validator: (_, v) =>
+                            !v || new TextEncoder().encode(v).length <= 72
+                              ? Promise.resolve()
+                              : Promise.reject(
+                                  new Error('密码过长：最多 72 字节（约 24 个汉字或 72 个英文字符）'),
+                                ),
+                        },
+                      ]}
+                    >
                       <Input.Password />
                     </Form.Item>
                     <Button type="primary" block loading={submitting} onClick={handleRegister}>

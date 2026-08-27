@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user, get_db
@@ -22,6 +22,14 @@ class RegisterIn(BaseModel):
     password: str
     role: str = "员工"
     # 注册时不涉及公司，公司在设置页中加入或申请成为管理员
+
+    @field_validator("password")
+    @classmethod
+    def password_max_72_bytes(cls, v: str) -> str:
+        # bcrypt 上限 72 字节（UTF-8 汉字每字 3 字节）；明确拒绝而非静默截断
+        if len(v.encode("utf-8")) > 72:
+            raise ValueError("密码过长：最多 72 字节（约 24 个汉字或 72 个英文字符）")
+        return v
 
 
 class LoginIn(BaseModel):
