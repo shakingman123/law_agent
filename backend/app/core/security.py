@@ -6,34 +6,39 @@ from typing import Any, Optional
 
 from cryptography.fernet import Fernet, InvalidToken
 from jose import JWTError, jwt
-from passlib.context import CryptContext
+import bcrypt
 
 from app.core.config import settings
 
-# ---- 密码哈希（passlib bcrypt）----
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# ---- 密码哈希（直接使用 bcrypt 库，弃用 passlib）----
+# 弃用原因：passlib 1.7.4 已停止维护，其初始化自检（detect_wrap_bug）向 bcrypt 库
+# 传入 100 字节固定测试串，bcrypt >= 4.0 对超 72 字节输入直接抛 ValueError，
+# 导致后端初始化失败、所有密码哈希/校验 500（与用户密码长短无关）。
 
-# bcrypt 算法硬限制：输入最长 72 字节（UTF-8 下一个汉字占 3 字节，即约 24 个汉字）
-# 新版 bcrypt 超限直接抛 ValueError 导致 500，故统一按字节安全截断后再哈希/校验，
-# 保证哈希与校验使用同一截断逻辑、互相一致。
+# bcrypt 算法硬限制：输入最长 72 字节（UTF-8 下一个汉字占 3 字节，即约 24 个汉字）。
+# 哈希与校验前统一按整字符截断，保证两侧逻辑一致、且永不超限。
 _BCRYPT_MAX_BYTES = 72
 
 
-def _bcrypt_safe(password: str) -> str:
-    """将密码截断到 UTF-8 编码不超过 72 字节（按整字符截断，不切半个字）。"""
+def _bcrypt_safe(password: str) -> bytes:
+    """将密码截断到 UTF-8 编码不超过 72 字节（按整字符截断，不切半个字），返回字节串。"""
     if len(password.encode("utf-8")) <= _BCRYPT_MAX_BYTES:
-        return password
+        return password.encode("utf-8")
     while len(password.encode("utf-8")) > _BCRYPT_MAX_BYTES:
         password = password[:-1]
-    return password
+    return password.encode("utf-8")
 
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(_bcrypt_safe(password))
+    return bcrypt.hashpw(_bcrypt_safe(password), bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(_bcrypt_safe(plain), hashed)
+    try:
+        return bcrypt.checkpw(_bcrypt_safe(plain), hashed.encode("utf-8"))
+    except ValueError:
+        # 库中哈希格式非法等情况一律视为校验失败
+        return False
 
 
 # ---- JWT（python-jose）----

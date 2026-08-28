@@ -4,7 +4,7 @@ sqlalchemy
 alembic
 pydantic-settings
 python-jose
-passlib[bcrypt]
+bcrypt
 python-multipart
 cryptography
 # Agent 编排（依据 docs/implementation-guide.md 阶段 3）
