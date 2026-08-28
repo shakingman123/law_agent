@@ -28,6 +28,9 @@ export default function UserCard() {
       message.success('登录成功');
       setAuthOpen(false);
       loginForm.resetFields();
+      // 开发者账号登录后直接进入开发者控制台
+      const u = useAuthStore.getState().user;
+      navigate(u?.isDeveloper ? '/developer' : '/workbench');
     } catch {
       /* 校验或请求失败 */
     } finally {

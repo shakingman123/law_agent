@@ -25,7 +25,8 @@ import type { UploadFile } from 'antd';
 import { useAuthStore } from '../../stores/authStore';
 import { colors } from '../../theme/tokens';
 import LlmApiPanel from '../../components/settings/LlmApiPanel';
-import { authApi, type InviteCode, type JoinRequest } from '../../api/auth';
+import { authApi, type AdminRequest, type InviteCode, type JoinRequest } from '../../api/auth';
+import { filesApi } from '../../api/files';
 import { useNavigate } from 'react-router-dom';
 
 type Section = 'basic' | 'interface' | 'company' | 'llm';
@@ -52,10 +53,12 @@ export default function Settings() {
   const [inviteCode, setInviteCode] = useState('');
   const { message } = App.useApp();
 
-  // 管理员申请相关状态
-  const [licenseFiles, setLicenseFiles] = useState<UploadFile[]>([]);
-  const [authFiles, setAuthFiles] = useState<UploadFile[]>([]);
-  const [adminReqStatus, setAdminReqStatus] = useState<'none' | 'pending' | 'approved' | 'rejected'>('none');
+  // 成为公司管理员：申请记录 + 弹窗上传执照/授权书
+  const [myRequest, setMyRequest] = useState<AdminRequest | null>(null);
+  const [applyOpen, setApplyOpen] = useState(false);
+  const [applyReason, setApplyReason] = useState('');
+  const [licenseFile, setLicenseFile] = useState<UploadFile[]>([]);
+  const [authFile, setAuthFile] = useState<UploadFile[]>([]);
   const [submittingAdmin, setSubmittingAdmin] = useState(false);
 
   // 成为公司管理员：输入公司名 → 查是否已有管理员 → 决定是否可申请
@@ -101,6 +104,13 @@ export default function Settings() {
   useEffect(() => {
     if (section === 'company') {
       loadCompanyAdminData();
+      // 非管理员：加载自己的管理员申请状态（待审核/已通过/已驳回）
+      if (!user?.isAdmin) {
+        authApi
+          .getMyAdminRequest()
+          .then(setMyRequest)
+          .catch(() => setMyRequest(null));
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [section, user?.isAdmin, user?.companyId]);
@@ -195,26 +205,39 @@ export default function Settings() {
     }
   };
 
+  const openApplyModal = () => {
+    setApplyReason('');
+    setLicenseFile([]);
+    setAuthFile([]);
+    setApplyOpen(true);
+  };
+
   const handleApplyAdmin = async () => {
-    if (licenseFiles.length === 0) {
+    if (licenseFile.length === 0) {
       message.error('请上传营业执照');
       return;
     }
-    if (authFiles.length === 0) {
-      message.error('请上传法人授权签字文件');
+    if (authFile.length === 0) {
+      message.error('请上传法人授权书');
       return;
     }
     setSubmittingAdmin(true);
     try {
-      const licenseUrl = licenseFiles[0]?.name || '';
-      const authUrl = authFiles[0]?.name || '';
+      // 先上传两个附件拿到 URL，再提交申请
+      const [licenseRes, authRes] = await Promise.all([
+        filesApi.upload(licenseFile[0].originFileObj as File),
+        filesApi.upload(authFile[0].originFileObj as File),
+      ]);
       await authApi.createAdminRequest({
         company_name: applyCompanyName.trim(),
-        business_license_url: licenseUrl,
-        legal_person_auth_url: authUrl,
+        reason: applyReason.trim() || undefined,
+        business_license_url: licenseRes.url,
+        legal_person_auth_url: authRes.url,
       });
-      setAdminReqStatus('pending');
-      message.success('管理员申请已提交，等待平台审核');
+      setApplyOpen(false);
+      message.success('管理员申请已提交，等待平台开发者审核');
+      const req = await authApi.getMyAdminRequest();
+      setMyRequest(req);
     } catch (e: any) {
       message.error(e?.response?.data?.detail || '提交失败');
     } finally {
@@ -576,17 +599,35 @@ export default function Settings() {
                     showIcon
                     message={`您已是「${user.company}」的管理员`}
                   />
-                ) : adminReqStatus === 'pending' ? (
+                ) : myRequest?.status === 'pending' ? (
                   <Alert
                     type="info"
                     showIcon
-                    message="您的管理员申请已提交，正在等待平台审核"
-                    description="审核通过后，您将获得管理员权限，可配置公司 API、管理成员用量。"
+                    message="您的管理员申请正在等待平台开发者审核"
+                    description={`申请管理公司「${myRequest.company_name}」 · 提交于 ${new Date(
+                      myRequest.created_at,
+                    ).toLocaleString()}`}
+                  />
+                ) : myRequest?.status === 'approved' ? (
+                  <Alert
+                    type="success"
+                    showIcon
+                    message="您的管理员申请已通过"
+                    description="请刷新页面获取管理员权限"
                   />
                 ) : (
                   <>
+                    {myRequest?.status === 'rejected' && (
+                      <Alert
+                        type="warning"
+                        showIcon
+                        message="您此前的管理员申请未通过审核"
+                        description="可补充完整资料后重新申请"
+                        style={{ marginBottom: 12 }}
+                      />
+                    )}
                     <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
-                      输入公司名称查询，若该公司尚无管理员，可上传营业执照和法人授权书申请成为管理员
+                      输入公司名称查询：若该公司尚无管理员或平台上尚不存在，可上传营业执照和法人授权书申请成为管理员
                     </Typography.Text>
 
                     {/* 第一步：输入公司名查询 */}
@@ -609,13 +650,18 @@ export default function Settings() {
                       </Button>
                     </Space.Compact>
 
-                    {/* 查询结果 */}
+                    {/* 查询结果：公司不存在 → 弹出上传资料界面 */}
                     {companyCheck.notFound && (
                       <Alert
                         type="warning"
                         showIcon
-                        message={`公司「${applyCompanyName}」不存在`}
-                        description="请确认公司名称是否正确，或联系平台创建该公司"
+                        message={`公司「${applyCompanyName}」在平台上尚不存在`}
+                        description="可上传公司营业执照和法人授权书，经平台开发者确认后创建该公司并将您设为管理员"
+                        action={
+                          <Button type="primary" size="small" onClick={openApplyModal}>
+                            上传资料申请
+                          </Button>
+                        }
                         style={{ marginBottom: 12 }}
                       />
                     )}
@@ -630,51 +676,19 @@ export default function Settings() {
                       />
                     )}
 
-                    {/* 公司无管理员 → 显示上传文件表单 */}
+                    {/* 公司存在但无管理员 → 同样弹出上传资料界面 */}
                     {companyCheck.hasAdmin === false && (
-                      <Form layout="vertical">
-                        <Alert
-                          type="success"
-                          showIcon
-                          message={`「${applyCompanyName}」尚无管理员，可申请`}
-                          style={{ marginBottom: 12 }}
-                        />
-                        <Form.Item label="营业执照" required>
-                          <Upload
-                            beforeUpload={() => false}
-                            maxCount={1}
-                            fileList={licenseFiles}
-                            onChange={({ fileList }) => setLicenseFiles(fileList.slice(-1))}
-                            accept=".pdf,.jpg,.jpeg,.png"
-                          >
-                            <Button icon={<UploadOutlined />}>上传营业执照</Button>
-                          </Upload>
-                        </Form.Item>
-                        <Form.Item label="法人授权签字文件" required>
-                          <Upload
-                            beforeUpload={() => false}
-                            maxCount={1}
-                            fileList={authFiles}
-                            onChange={({ fileList }) => setAuthFiles(fileList.slice(-1))}
-                            accept=".pdf,.jpg,.jpeg,.png"
-                          >
-                            <Button icon={<UploadOutlined />}>上传法人授权书</Button>
-                          </Upload>
-                        </Form.Item>
-                        <Form.Item label="申请说明（可选）">
-                          <Input.TextArea
-                            placeholder="补充说明您的身份与申请理由"
-                            rows={2}
-                          />
-                        </Form.Item>
-                        <Button
-                          type="primary"
-                          loading={submittingAdmin}
-                          onClick={handleApplyAdmin}
-                        >
-                          提交申请
-                        </Button>
-                      </Form>
+                      <Alert
+                        type="success"
+                        showIcon
+                        message={`「${applyCompanyName}」尚无管理员，可申请`}
+                        description="上传营业执照和法人授权书，经平台开发者审核通过后您将成为该公司管理员"
+                        action={
+                          <Button type="primary" size="small" onClick={openApplyModal}>
+                            上传资料申请
+                          </Button>
+                        }
+                      />
                     )}
                   </>
                 )}
@@ -712,6 +726,60 @@ export default function Settings() {
           </div>
         </div>
       </Card>
+
+      {/* 成为公司管理员申请弹窗：上传营业执照 + 法人授权书 */}
+      <Modal
+        title={`申请成为「${applyCompanyName}」的管理员`}
+        open={applyOpen}
+        onCancel={() => setApplyOpen(false)}
+        onOk={handleApplyAdmin}
+        okText="提交申请"
+        cancelText="取消"
+        confirmLoading={submittingAdmin}
+        okButtonProps={{
+          disabled: licenseFile.length === 0 || authFile.length === 0,
+        }}
+      >
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message="平台开发者将根据资料的完整性审核您的申请"
+          description="审核通过后您将成为该公司管理员；若公司尚不存在，将一并创建。"
+        />
+        <Form layout="vertical">
+          <Form.Item label="公司营业执照" required>
+            <Upload
+              beforeUpload={() => false}
+              maxCount={1}
+              fileList={licenseFile}
+              onChange={({ fileList }) => setLicenseFile(fileList.slice(-1))}
+              accept=".pdf,.jpg,.jpeg,.png"
+            >
+              <Button icon={<UploadOutlined />}>上传营业执照</Button>
+            </Upload>
+          </Form.Item>
+          <Form.Item label="法人授权书" required>
+            <Upload
+              beforeUpload={() => false}
+              maxCount={1}
+              fileList={authFile}
+              onChange={({ fileList }) => setAuthFile(fileList.slice(-1))}
+              accept=".pdf,.jpg,.jpeg,.png"
+            >
+              <Button icon={<UploadOutlined />}>上传法人授权书</Button>
+            </Upload>
+          </Form.Item>
+          <Form.Item label="申请说明（可选）">
+            <Input.TextArea
+              placeholder="补充说明您的身份与申请理由"
+              rows={2}
+              value={applyReason}
+              onChange={(e) => setApplyReason(e.target.value)}
+            />
+          </Form.Item>
+        </Form>
+      </Modal>
     </div>
   );
 }

@@ -32,6 +32,8 @@ class User(Base):
     role = Column(String(64), default="员工")
     password_hash = Column(String(255), nullable=False)
     is_admin = Column(Boolean, default=False)
+    # 平台开发者：可进入开发者控制台审批「成为公司管理员」申请
+    is_developer = Column(Boolean, default=False)
     # 当前使用的 LLM 来源：company / personal
     llm_source = Column(String(16), default="company")
     created_at = Column(DateTime, default=datetime.utcnow)

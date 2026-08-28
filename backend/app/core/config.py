@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     CHECKPOINTER_SQLITE_PATH: str = "checkpoints.db"
     # PostgreSQL 检查点连接串（CHECKPOINTER_TYPE=postgres 时生效，留空则复用 DATABASE_URL）
     CHECKPOINTER_PG_URL: str = ""
+    # 平台开发者账号（启动时自动播种，可在 .env 覆盖）
+    DEVELOPER_EMAIL: str = "dev@lawagent.com"
+    DEVELOPER_PASSWORD: str = "dev123456"
 
     model_config = SettingsConfigDict(
         env_file=".env",

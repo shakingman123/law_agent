@@ -18,19 +18,51 @@ logging.basicConfig(
 )
 
 
-from app.api import auth, cases, chat, conversations, files, llm, prompts, rag, schedules, templates
+from app.api import auth, cases, chat, conversations, dev, files, llm, prompts, rag, schedules, templates
 from app.core.config import settings
 from app.core.database import Base, engine, SessionLocal
+from app.core.security import hash_password
+from app.models.user import User
 
 # 启动时自动建表（开发环境）。导入 models 以确保所有表注册到 Base.metadata。
 import app.models  # noqa: F401
 
 Base.metadata.create_all(bind=engine)
 
+# 轻量迁移：create_all 只建新表，不会给已存在的表补新列，这里手动补齐
+from sqlalchemy import inspect, text
+
+with engine.connect() as conn:
+    _insp = inspect(engine)
+
+    def _ensure_column(table: str, column: str, ddl: str):
+        if conn.dialect.has_table(conn, table):
+            cols = {c["name"] for c in _insp.get_columns(table)}
+            if column not in cols:
+                conn.execute(text(ddl))
+
+    _ensure_column("users", "is_developer", "ALTER TABLE users ADD COLUMN is_developer BOOLEAN DEFAULT 0")
+    _ensure_column("admin_requests", "company_id", "ALTER TABLE admin_requests ADD COLUMN company_id INTEGER")
+    conn.commit()
+
 # 播种默认 prompts + 公共模板（幂等）
 with SessionLocal() as db:
     prompts.seed_default_prompts(db)
     templates.seed_templates(db)
+
+    # 播种平台开发者账号（幂等；账号密码可在 .env 用 DEVELOPER_EMAIL/DEVELOPER_PASSWORD 覆盖）
+    if not db.query(User).filter(User.email == settings.DEVELOPER_EMAIL).first():
+        db.add(
+            User(
+                name="平台开发者",
+                email=settings.DEVELOPER_EMAIL,
+                role="开发者",
+                password_hash=hash_password(settings.DEVELOPER_PASSWORD),
+                is_developer=True,
+                llm_source="company",
+            )
+        )
+        db.commit()
 
 app = FastAPI(title="Law Agent Backend", version="0.1.0")
 
@@ -54,6 +86,7 @@ app.include_router(files.router)
 app.include_router(conversations.router)
 app.include_router(templates.router)
 app.include_router(schedules.router)
+app.include_router(dev.router)
 
 
 @app.get("/")

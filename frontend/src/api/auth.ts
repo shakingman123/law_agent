@@ -20,6 +20,7 @@ export interface AuthUser {
   company_name: string;
   role: string;
   is_admin: boolean;
+  is_developer?: boolean;
   avatar?: string;
   llm_source: 'company' | 'personal';
 }
@@ -77,6 +78,35 @@ export interface JoinRequest {
   reviewed_at?: string | null;
 }
 
+// ---- 开发者控制台 ----
+export interface DevCompanyItem {
+  id: number;
+  name: string;
+  admin_name?: string | null;
+  admin_email?: string | null;
+  admin_phone?: string | null;
+  member_count: number;
+}
+
+export interface DevAdminRequestItem {
+  id: number;
+  user_id: number;
+  user_name: string;
+  user_email: string;
+  company_name: string;
+  status: 'pending' | 'approved' | 'rejected';
+  reason?: string | null;
+  business_license_url?: string | null;
+  legal_person_auth_url?: string | null;
+  created_at: string;
+  reviewed_at?: string | null;
+}
+
+export interface DevOverview {
+  companies: DevCompanyItem[];
+  admin_requests: DevAdminRequestItem[];
+}
+
 export const authApi = {
   login: (payload: LoginPayload) =>
     request.post<AuthResult>('/auth/login', payload).then((r) => r.data),
@@ -124,5 +154,19 @@ export const authApi = {
   rejectJoinRequest: (reqId: number) =>
     request
       .post<JoinRequest>(`/auth/company/join-requests/${reqId}/reject`)
+      .then((r) => r.data),
+
+  // ---- 开发者控制台 ----
+  devOverview: () =>
+    request.get<DevOverview>('/dev/overview').then((r) => r.data),
+
+  devApproveAdminRequest: (reqId: number) =>
+    request
+      .post<DevAdminRequestItem>(`/dev/admin-requests/${reqId}/approve`)
+      .then((r) => r.data),
+
+  devRejectAdminRequest: (reqId: number) =>
+    request
+      .post<DevAdminRequestItem>(`/dev/admin-requests/${reqId}/reject`)
       .then((r) => r.data),
 };

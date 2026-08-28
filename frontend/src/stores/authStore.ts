@@ -17,6 +17,7 @@ export interface User {
   companyId?: string;
   role: string;
   isAdmin: boolean;
+  isDeveloper?: boolean;
   llmSource: 'company' | 'personal';
 }
 
@@ -45,6 +46,7 @@ const mapUser = (u: AuthUser): User => ({
   companyId: u.company_id ?? undefined,
   role: u.role,
   isAdmin: u.is_admin,
+  isDeveloper: !!u.is_developer,
   llmSource: u.llm_source,
 });
 

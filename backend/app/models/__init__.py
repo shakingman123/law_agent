@@ -1,3 +1,4 @@
+from app.models.admin_request import AdminRequest
 from app.models.case import Case, CaseDocument
 from app.models.conversation import Conversation, Message
 from app.models.legal_reference import LegalReference
@@ -16,6 +17,7 @@ from app.models.user import Company, User
 __all__ = [
     "User",
     "Company",
+    "AdminRequest",
     "CompanyLlmConfig",
     "UserLlmConfig",
     "LlmUsageRecord",

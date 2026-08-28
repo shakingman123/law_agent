@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user, get_db
 from app.core.security import create_access_token, hash_password, verify_password
+from app.models.admin_request import AdminRequest
 from app.models.user import Company, User
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -46,6 +47,7 @@ class UserOut(BaseModel):
     role: str
     avatar: Optional[str] = None
     is_admin: bool
+    is_developer: bool = False
     llm_source: str
 
 
@@ -68,7 +70,8 @@ class AdminRequestOut(BaseModel):
     id: int
     user_id: int
     user_name: str
-    company_id: int
+    user_email: str = ""
+    company_id: Optional[int] = None
     company_name: str
     status: str  # pending / approved / rejected
     reason: Optional[str] = None
@@ -133,6 +136,7 @@ def _user_out(user: User, db: Session) -> UserOut:
         role=user.role,
         avatar=user.avatar,
         is_admin=user.is_admin,
+        is_developer=bool(user.is_developer),
         llm_source=user.llm_source or "company",
     )
 
@@ -177,10 +181,25 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     return _user_out(user, db)
 
 
-# ---------------- 管理员申请 ----------------
-# 简单的内存存储（后续可迁移到数据库表）
-_admin_requests: list[dict] = []
-_req_counter = {"n": 0}
+# ---------------- 管理员申请（数据库存储，由平台开发者审批） ----------------
+def _admin_request_out(req: AdminRequest, db: Session) -> AdminRequestOut:
+    applicant = db.get(User, req.user_id)
+    company = db.get(Company, req.company_id) if req.company_id else None
+    return AdminRequestOut(
+        id=req.id,
+        user_id=req.user_id,
+        user_name=applicant.name if applicant else "未知",
+        user_email=applicant.email if applicant else "",
+        company_id=req.company_id,
+        company_name=req.company_name,
+        status=req.status,
+        reason=req.reason,
+        business_license_url=req.business_license_url,
+        legal_person_auth_url=req.legal_person_auth_url,
+        created_at=req.created_at,
+        reviewed_at=req.reviewed_at,
+        reviewed_by=req.reviewed_by,
+    )
 
 
 @router.get("/company-admin-status", response_model=CompanyAdminStatus)
@@ -211,26 +230,15 @@ def create_admin_request(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """申请成为公司管理员。需上传营业执照和法人授权书。
+    """申请成为公司管理员。需上传营业执照和法人授权书，由平台开发者审批。
 
     条件：
-    - 公司存在且当前无管理员
-    - 用户非管理员
+    - 用户非管理员；公司可以不存在（审批通过时由开发者创建）
+    - 若公司存在则必须尚无管理员
     - 无重复 pending 申请
     """
     if user.is_admin:
         raise HTTPException(status_code=400, detail="您已是管理员")
-
-    company = db.query(Company).filter(Company.name == payload.company_name).first()
-    if not company:
-        raise HTTPException(status_code=404, detail=f"公司「{payload.company_name}」不存在")
-    if company.admin_id is not None:
-        admin = db.get(User, company.admin_id)
-        admin_name = admin.name if admin else "未知"
-        raise HTTPException(
-            status_code=400,
-            detail=f"公司「{payload.company_name}」已有管理员（{admin_name}），无需申请",
-        )
 
     if not payload.business_license_url or not payload.legal_person_auth_url:
         raise HTTPException(
@@ -238,43 +246,54 @@ def create_admin_request(
             detail="需上传营业执照和法人授权签字文件",
         )
 
-    # 查重
-    for r in _admin_requests:
-        if (
-            r["user_id"] == user.id
-            and r["company_id"] == company.id
-            and r["status"] == "pending"
-        ):
-            raise HTTPException(status_code=400, detail="已有待审核的管理员申请")
+    company = db.query(Company).filter(Company.name == payload.company_name).first()
+    if company and company.admin_id is not None:
+        admin = db.get(User, company.admin_id)
+        admin_name = admin.name if admin else "未知"
+        raise HTTPException(
+            status_code=400,
+            detail=f"公司「{payload.company_name}」已有管理员（{admin_name}），无需申请",
+        )
 
-    _req_counter["n"] += 1
-    req = {
-        "id": _req_counter["n"],
-        "user_id": user.id,
-        "user_name": user.name,
-        "company_id": company.id,
-        "company_name": company.name,
-        "status": "pending",
-        "reason": payload.reason,
-        "business_license_url": payload.business_license_url,
-        "legal_person_auth_url": payload.legal_person_auth_url,
-        "created_at": datetime.utcnow(),
-        "reviewed_at": None,
-        "reviewed_by": None,
-    }
-    _admin_requests.append(req)
-    return AdminRequestOut(**req)
+    dup = (
+        db.query(AdminRequest)
+        .filter(
+            AdminRequest.user_id == user.id,
+            AdminRequest.company_name == payload.company_name,
+            AdminRequest.status == "pending",
+        )
+        .first()
+    )
+    if dup:
+        raise HTTPException(status_code=400, detail="已有待审核的管理员申请")
+
+    req = AdminRequest(
+        user_id=user.id,
+        company_name=payload.company_name,
+        status="pending",
+        reason=payload.reason,
+        business_license_url=payload.business_license_url,
+        legal_person_auth_url=payload.legal_person_auth_url,
+    )
+    db.add(req)
+    db.commit()
+    db.refresh(req)
+    return _admin_request_out(req, db)
 
 
 @router.get("/admin-request", response_model=Optional[AdminRequestOut])
 def get_my_admin_request(
     user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """查询当前用户的最新管理员申请状态。"""
-    for r in reversed(_admin_requests):
-        if r["user_id"] == user.id:
-            return AdminRequestOut(**r)
-    return None
+    req = (
+        db.query(AdminRequest)
+        .filter(AdminRequest.user_id == user.id)
+        .order_by(AdminRequest.id.desc())
+        .first()
+    )
+    return _admin_request_out(req, db) if req else None
 
 
 # ---------------- 邀请码 / 员工加入 ----------------
