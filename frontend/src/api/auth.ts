@@ -17,7 +17,7 @@ export interface AuthUser {
   name: string;
   email: string;
   company_id: string | null;
-  company_name: string;
+  company: string | null;
   role: string;
   is_admin: boolean;
   is_developer?: boolean;

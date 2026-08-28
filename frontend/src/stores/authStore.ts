@@ -42,7 +42,7 @@ const mapUser = (u: AuthUser): User => ({
   id: u.id,
   name: u.name,
   email: u.email,
-  company: u.company_name || '未加入公司',
+  company: u.company || '未加入公司',
   companyId: u.company_id ?? undefined,
   role: u.role,
   isAdmin: u.is_admin,
