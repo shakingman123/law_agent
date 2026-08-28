@@ -151,7 +151,7 @@ export default function UserCard() {
         borderTop: `1px solid ${colors.border}`,
       }}
     >
-      <Avatar size={38} style={{ backgroundColor: colors.primary, flexShrink: 0 }}>
+      <Avatar size={38} src={user.avatar || undefined} style={{ backgroundColor: colors.primary, flexShrink: 0 }}>
         {user.name[0]}
       </Avatar>
       <div style={{ flex: 1, marginLeft: 12, overflow: 'hidden' }}>

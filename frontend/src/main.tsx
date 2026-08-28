@@ -8,7 +8,7 @@ import 'antd/dist/reset.css';
 import './styles/global.css';
 import App from './App';
 import { router } from './router';
-import { antdTheme } from './theme/tokens';
+import { useUiStore } from './stores/uiStore';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -20,16 +20,21 @@ const queryClient = new QueryClient({
   },
 });
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <ConfigProvider theme={antdTheme} locale={zhCN}>
-      <AntdApp>
-        <QueryClientProvider client={queryClient}>
-          <App>
-            <RouterProvider router={router} />
-          </App>
-        </QueryClientProvider>
-      </AntdApp>
-    </ConfigProvider>
-  </StrictMode>,
-);
+function Root() {
+  const antdTheme = useUiStore((s) => s.antdTheme);
+  return (
+    <StrictMode>
+      <ConfigProvider theme={antdTheme} locale={zhCN}>
+        <AntdApp>
+          <QueryClientProvider client={queryClient}>
+            <App>
+              <RouterProvider router={router} />
+            </App>
+          </QueryClientProvider>
+        </AntdApp>
+      </ConfigProvider>
+    </StrictMode>
+  );
+}
+
+createRoot(document.getElementById('root')!).render(<Root />);

@@ -45,10 +45,18 @@ class UserOut(BaseModel):
     company: Optional[str] = None
     company_id: Optional[int] = None
     role: str
+    phone: Optional[str] = None
     avatar: Optional[str] = None
     is_admin: bool
     is_developer: bool = False
     llm_source: str
+
+
+class ProfileUpdateIn(BaseModel):
+    """基本信息修改：姓名/手机号可改，邮箱、职级不可改。"""
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    avatar: Optional[str] = None
 
 
 class TokenOut(BaseModel):
@@ -138,6 +146,7 @@ def _user_out(user: User, db: Session) -> UserOut:
         company=company_name,
         company_id=company_id,
         role=user.role,
+        phone=user.phone,
         avatar=user.avatar,
         is_admin=user.is_admin,
         is_developer=bool(user.is_developer),
@@ -182,6 +191,29 @@ def login(payload: LoginIn, db: Session = Depends(get_db)):
 
 @router.get("/me", response_model=UserOut)
 def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return _user_out(user, db)
+
+
+@router.put("/me", response_model=UserOut)
+def update_profile(
+    payload: ProfileUpdateIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """修改基本信息：姓名/手机号/头像；邮箱、职级、上级不可修改。"""
+    changed = False
+    if payload.name is not None and payload.name.strip():
+        user.name = payload.name.strip()
+        changed = True
+    if payload.phone is not None:
+        user.phone = payload.phone.strip() or None
+        changed = True
+    if payload.avatar is not None:
+        user.avatar = payload.avatar or None
+        changed = True
+    if changed:
+        db.commit()
+        db.refresh(user)
     return _user_out(user, db)
 
 

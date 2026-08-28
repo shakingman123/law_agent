@@ -19,6 +19,7 @@ export interface AuthUser {
   company_id: string | null;
   company: string | null;
   role: string;
+  phone?: string | null;
   is_admin: boolean;
   is_developer?: boolean;
   avatar?: string;
@@ -115,6 +116,9 @@ export const authApi = {
     request.post<AuthResult>('/auth/register', payload).then((r) => r.data),
 
   getMe: () => request.get<AuthUser>('/auth/me').then((r) => r.data),
+
+  updateProfile: (payload: { name?: string; phone?: string; avatar?: string }) =>
+    request.put<AuthUser>('/auth/me', payload).then((r) => r.data),
 
   getCompanyAdminStatus: (companyName: string) =>
     request

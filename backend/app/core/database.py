@@ -1,4 +1,4 @@
-"""SQLAlchemy engine / session / Base（开发环境 SQLite）。"""
+"""SQLAlchemy engine / session / Base（默认 SQLite，生产可切 PostgreSQL）。"""
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 

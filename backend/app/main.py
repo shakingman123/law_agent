@@ -44,6 +44,8 @@ with engine.connect() as conn:
     # BOOLEAN DEFAULT FALSE 兼容 PostgreSQL 与 SQLite（PG 的 BOOLEAN 不接受整数 0）
     _ensure_column("users", "is_developer", "ALTER TABLE users ADD COLUMN is_developer BOOLEAN DEFAULT FALSE")
     _ensure_column("admin_requests", "company_id", "ALTER TABLE admin_requests ADD COLUMN company_id INTEGER")
+    # 直属上级（用户对用户外键，SQLite 不强制检查 FK，PG 也兼容）
+    _ensure_column("users", "supervisor_id", "ALTER TABLE users ADD COLUMN supervisor_id INTEGER")
     conn.commit()
 
 # 播种默认 prompts + 公共模板（幂等）

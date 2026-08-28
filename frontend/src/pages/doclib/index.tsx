@@ -13,6 +13,9 @@ import {
   Empty,
   App,
   Spin,
+  Form,
+  Select,
+  Upload,
 } from 'antd';
 import {
   SearchOutlined,
@@ -22,7 +25,10 @@ import {
   FileImageOutlined,
   VideoCameraOutlined,
   FolderOutlined,
+  PlusOutlined,
+  PaperClipOutlined,
 } from '@ant-design/icons';
+import type { UploadFile } from 'antd';
 import { colors } from '../../theme/tokens';
 import { useCaseStore } from '../../stores/caseStore';
 import type { Case } from '../../api/cases';
@@ -63,6 +69,7 @@ const mapCaseToDoc = (c: Case): DocCase => ({
  * 文档库页
  * 依据 figma-design-spec.md §5：密码门禁 → 搜索栏 → 案件卡片（按更新时间排序）→ 未解锁弹窗
  * 案件数据从后端 /api/cases 拉取（含上传的资料文档）
+ * 「新建文档」逻辑与工作台右侧新建案件保持一致：创建案件后可直接在文档库中管理
  */
 export default function DocLib() {
   const [unlocked, setUnlocked] = useState(false);
@@ -71,8 +78,14 @@ export default function DocLib() {
   const [keyword, setKeyword] = useState('');
   const [unlockTarget, setUnlockTarget] = useState<DocCase | null>(null);
   const { message } = App.useApp();
-  const { allCases, loading, loadAll } = useCaseStore();
+  const { allCases, loading, loadAll, createCase } = useCaseStore();
   const navigate = useNavigate();
+
+  // 新建案件弹窗状态（与工作台右侧新建案件保持一致）
+  const [modalOpen, setModalOpen] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [form] = Form.useForm();
+  const [fileList, setFileList] = useState<UploadFile[]>([]);
 
   useEffect(() => {
     if (unlocked) {
@@ -81,6 +94,31 @@ export default function DocLib() {
   }, [unlocked, loadAll]);
 
   const docCases = allCases.map(mapCaseToDoc);
+
+  const closeModal = () => {
+    setModalOpen(false);
+    form.resetFields();
+    setFileList([]);
+  };
+
+  const handleCreate = async () => {
+    try {
+      const values = await form.validateFields();
+      setSubmitting(true);
+      const files = fileList
+        .map((f) => f.originFileObj as File)
+        .filter(Boolean);
+      const created = await createCase(values, files);
+      message.success('案件已创建');
+      closeModal();
+      navigate(`/cases/${created.id}`);
+    } catch (e: any) {
+      if (e?.errorFields) return; // antd 校验错误不弹 toast
+      message.error(e?.response?.data?.detail || '创建失败');
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   // 门禁态
   if (!unlocked) {
@@ -168,6 +206,17 @@ export default function DocLib() {
               onChange={setTab}
               options={['全部', '私库', '公库']}
             />
+            <Button
+              type="primary"
+              icon={<PlusOutlined />}
+              onClick={() => {
+                form.resetFields();
+                setFileList([]);
+                setModalOpen(true);
+              }}
+            >
+              新建文档
+            </Button>
           </Space>
         }
         styles={{ body: { padding: 16 } }}
@@ -177,7 +226,11 @@ export default function DocLib() {
             <Spin />
           </div>
         ) : filteredCases.length === 0 ? (
-          <Empty description="暂无匹配案件" />
+          <Empty description="暂无匹配案件">
+            <Button type="primary" icon={<PlusOutlined />} onClick={() => setModalOpen(true)}>
+              创建第一个案件
+            </Button>
+          </Empty>
         ) : (
           <List
             grid={{ gutter: 16, column: 3 }}
@@ -222,6 +275,90 @@ export default function DocLib() {
           />
         )}
       </Card>
+
+      {/* 新建文档弹窗 — 与工作台右侧新建案件保持一致 */}
+      <Modal
+        title="新建文档（案件）"
+        open={modalOpen}
+        onCancel={closeModal}
+        width={520}
+        footer={[
+          <Button key="cancel" onClick={closeModal}>
+            取消
+          </Button>,
+          <Button
+            key="ok"
+            type="primary"
+            loading={submitting}
+            onClick={handleCreate}
+          >
+            创建
+          </Button>,
+        ]}
+      >
+        <Form
+          form={form}
+          layout="vertical"
+          initialValues={{ scope: 'private' }}
+          style={{ marginTop: 8 }}
+        >
+          <Form.Item
+            name="name"
+            label="案件名称"
+            rules={[{ required: true, message: '请输入案件名称' }]}
+          >
+            <Input placeholder="如：张某诉李某合同纠纷" />
+          </Form.Item>
+          <Form.Item
+            name="plaintiff"
+            label="原告"
+            rules={[{ required: true, message: '请输入原告' }]}
+          >
+            <Input placeholder="原告姓名/单位" />
+          </Form.Item>
+          <Form.Item
+            name="defendant"
+            label="被告"
+            rules={[{ required: true, message: '请输入被告' }]}
+          >
+            <Input placeholder="被告姓名/单位" />
+          </Form.Item>
+          <Form.Item
+            name="court"
+            label="管辖法院"
+            rules={[{ required: true, message: '请输入管辖法院' }]}
+          >
+            <Input placeholder="如：北京市朝阳区人民法院" />
+          </Form.Item>
+          <Form.Item name="summary" label="案件基本情况">
+            <Input.TextArea rows={3} placeholder="简要描述案件情况（选填）" />
+          </Form.Item>
+          <Form.Item name="scope" label="可见范围">
+            <Select
+              options={[
+                { value: 'private', label: '私库（仅自己可见）' },
+                { value: 'public', label: '公库（协作可见）' },
+              ]}
+            />
+          </Form.Item>
+          <Form.Item label="案件资料">
+            <Upload
+              multiple
+              fileList={fileList}
+              beforeUpload={() => false}
+              onChange={({ fileList }) => setFileList(fileList)}
+              onRemove={(file) => {
+                setFileList((list) => list.filter((f) => f.uid !== file.uid));
+              }}
+            >
+              <Button icon={<PaperClipOutlined />}>上传资料</Button>
+            </Upload>
+            <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+              可上传判决书、证据、合同等文件
+            </Typography.Text>
+          </Form.Item>
+        </Form>
+      </Modal>
 
       <Modal
         title="案件未解锁"

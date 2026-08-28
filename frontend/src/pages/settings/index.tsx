@@ -23,6 +23,7 @@ import {
 import { UserOutlined, BgColorsOutlined, HomeOutlined, ApiOutlined, UploadOutlined, CrownOutlined, LogoutOutlined, CopyOutlined, ReloadOutlined, TeamOutlined, CheckOutlined, CloseOutlined } from '@ant-design/icons';
 import type { UploadFile } from 'antd';
 import { useAuthStore } from '../../stores/authStore';
+import { useUiStore, type FontSize, type BgTheme } from '../../stores/uiStore';
 import { colors } from '../../theme/tokens';
 import LlmApiPanel from '../../components/settings/LlmApiPanel';
 import { authApi, type AdminRequest, type InviteCode, type JoinRequest } from '../../api/auth';
@@ -48,8 +49,16 @@ export default function Settings() {
   const { user, setUser, logout } = useAuthStore();
   const navigate = useNavigate();
   const [basicForm] = Form.useForm();
-  const [fontSize, setFontSize] = useState<'小' | '中' | '大'>('中');
-  const [bgTheme, setBgTheme] = useState<'浅灰' | '米白' | '深色' | '护眼绿'>('浅灰');
+  const { settings, update: updateUi } = useUiStore();
+  const [fontSize, setFontSize] = useState<FontSize>(settings.fontSize);
+  const [bgTheme, setBgTheme] = useState<BgTheme>(settings.bgTheme);
+  // 切换到该 tab 时从 store 同步一次，避免其他页面改了之后显示过期
+  useEffect(() => {
+    if (section === 'interface') {
+      setFontSize(useUiStore.getState().settings.fontSize);
+      setBgTheme(useUiStore.getState().settings.bgTheme);
+    }
+  }, [section]);
   const [inviteCode, setInviteCode] = useState('');
   const { message } = App.useApp();
 
@@ -290,36 +299,101 @@ export default function Settings() {
               <div style={{ maxWidth: 480 }}>
                 <Typography.Title level={5}>基本信息</Typography.Title>
                 <div style={{ display: 'flex', alignItems: 'center', marginBottom: 24 }}>
-                  <Avatar size={64} style={{ backgroundColor: colors.primary }}>
-                    {user.name[0]}
+                  <Avatar size={64} src={user.avatar || undefined} style={{ backgroundColor: colors.primary }}>
+                    {user.name?.[0] || 'U'}
                   </Avatar>
-                  <Button style={{ marginLeft: 16 }}>更换头像</Button>
+                  <Upload
+                    showUploadList={false}
+                    accept="image/*"
+                    maxCount={1}
+                    beforeUpload={async (file) => {
+                      if (!file.type.startsWith('image/')) {
+                        message.error('只能上传图片作为头像');
+                        return Upload.LIST_IGNORE;
+                      }
+                      if (file.size > 5 * 1024 * 1024) {
+                        message.error('头像图片不能超过 5MB');
+                        return Upload.LIST_IGNORE;
+                      }
+                      try {
+                        const r = await filesApi.upload(file);
+                        await authApi.updateProfile({ avatar: r.url });
+                        // 刷新本地用户
+                        const me = await authApi.getMe();
+                        setUser({ avatar: me.avatar || undefined });
+                        message.success('头像更换成功');
+                      } catch (e: any) {
+                        message.error(e?.response?.data?.detail || '头像上传失败');
+                      }
+                      return Upload.LIST_IGNORE;
+                    }}
+                  >
+                    <Button icon={<UploadOutlined />} style={{ marginLeft: 16 }}>
+                      更换头像
+                    </Button>
+                  </Upload>
+                  {user.avatar && (
+                    <Button
+                      type="text"
+                      danger
+                      style={{ marginLeft: 8 }}
+                      onClick={async () => {
+                        try {
+                          await authApi.updateProfile({ avatar: '' });
+                          const me = await authApi.getMe();
+                          setUser({ avatar: me.avatar || undefined });
+                          message.success('已恢复默认头像');
+                        } catch (e: any) {
+                          message.error(e?.response?.data?.detail || '恢复失败');
+                        }
+                      }}
+                    >
+                      恢复默认
+                    </Button>
+                  )}
                 </div>
                 <Form
                   form={basicForm}
                   layout="vertical"
                   initialValues={{
                     name: user.name,
-                    email: 'zhang@lawfirm.com',
-                    phone: '13800138000',
-                    role: user.role,
+                    email: user.email ?? '',
+                    phone: user.phone ?? '',
+                    role: user.role ?? '',
                   }}
-                  onFinish={(v) => {
-                    setUser({ name: v.name, role: v.role });
-                    message.success('基本信息已保存');
+                  onFinish={async (v) => {
+                    try {
+                      await authApi.updateProfile({
+                        name: v.name,
+                        phone: v.phone ?? '',
+                      });
+                      // 重新拉取当前用户，刷新本地状态
+                      const me = await authApi.getMe();
+                      setUser({ name: me.name, phone: me.phone ?? null });
+                      message.success('基本信息已保存');
+                    } catch (e: any) {
+                      message.error(e?.response?.data?.detail || '保存失败');
+                    }
                   }}
                 >
-                  <Form.Item name="name" label="姓名" rules={[{ required: true }]}>
+                  <Form.Item name="name" label="姓名" rules={[{ required: true, message: '请输入姓名' }]}>
                     <Input />
                   </Form.Item>
-                  <Form.Item name="email" label="邮箱">
-                    <Input />
+                  {/* 邮箱与注册邮箱一致，不可修改 */}
+                  <Form.Item label="邮箱" tooltip="邮箱为注册账号，不可修改">
+                    <Input value={user.email ?? ''} disabled style={{ color: colors.muted }} />
                   </Form.Item>
+                  {/* 手机号：用户可自行填写 */}
                   <Form.Item name="phone" label="手机号">
-                    <Input />
+                    <Input placeholder="请输入手机号" />
                   </Form.Item>
-                  <Form.Item name="role" label="职级">
-                    <Input />
+                  {/* 职级：只读，由管理员在后台维护 */}
+                  <Form.Item label="职级" tooltip="职级由管理员在后台维护，不可自行修改">
+                    <Input
+                      value={user.role || '员工'}
+                      disabled
+                      style={{ color: colors.muted }}
+                    />
                   </Form.Item>
                   <Form.Item>
                     <Button type="primary" htmlType="submit">
@@ -348,8 +422,11 @@ export default function Settings() {
                   <Form.Item label="字体大小">
                     <Segmented
                       value={fontSize}
-                      onChange={(v) => setFontSize(v as typeof fontSize)}
-                      options={['小', '中', '大']}
+                      onChange={(v) => setFontSize(v as FontSize)}
+                      options={(['小', '中', '大'] as const).map((opt) => ({
+                        label: `${opt}${settings.fontSize === opt ? ' (当前)' : ''}`,
+                        value: opt,
+                      }))}
                     />
                   </Form.Item>
                   <Form.Item label="背景颜色">
@@ -386,18 +463,42 @@ export default function Settings() {
                               border: `1px solid ${colors.border}`,
                             }}
                           />
-                          <Typography.Text>{t}</Typography.Text>
+                          <Typography.Text>
+                            {t}
+                            {settings.bgTheme === t ? '  (当前)' : ''}
+                          </Typography.Text>
                         </label>
                       ))}
                     </Space>
                   </Form.Item>
+                  <Alert
+                    type="info"
+                    showIcon
+                    style={{ marginBottom: 12 }}
+                    message="修改后立即生效，配置保存到本地浏览器（下次打开自动恢复）"
+                  />
                   <Form.Item>
-                    <Button
-                      type="primary"
-                      onClick={() => message.success('界面设置已保存（仅本地演示）')}
-                    >
-                      保存
-                    </Button>
+                    <Space>
+                      <Button
+                        type="primary"
+                        onClick={() => {
+                          updateUi({ fontSize, bgTheme });
+                          message.success('界面设置已保存，已立即生效');
+                        }}
+                      >
+                        应用并保存
+                      </Button>
+                      <Button
+                        onClick={() => {
+                          setFontSize('中');
+                          setBgTheme('浅灰');
+                          updateUi({ fontSize: '中', bgTheme: '浅灰' });
+                          message.success('已恢复默认');
+                        }}
+                      >
+                        恢复默认
+                      </Button>
+                    </Space>
                   </Form.Item>
                 </Form>
               </div>

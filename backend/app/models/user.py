@@ -34,6 +34,8 @@ class User(Base):
     is_admin = Column(Boolean, default=False)
     # 平台开发者：可进入开发者控制台审批「成为公司管理员」申请
     is_developer = Column(Boolean, default=False)
+    # 直属上级（同公司其他用户的 id），展示用
+    supervisor_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     # 当前使用的 LLM 来源：company / personal
     llm_source = Column(String(16), default="company")
     created_at = Column(DateTime, default=datetime.utcnow)

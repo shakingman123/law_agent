@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { authApi, type AuthUser } from '../api/auth';
 import { reset401Warning } from '../api/request';
 import { useChatStore } from './chatStore';
+import { useUiStore } from './uiStore';
 import { storage } from '../utils/storage';
 
 /**
@@ -13,6 +14,8 @@ export interface User {
   id: string;
   name: string;
   email?: string;
+  phone?: string | null;
+  avatar?: string | null;
   company: string;
   companyId?: string;
   role: string;
@@ -36,12 +39,16 @@ interface AuthState {
   logout: () => void;
   /** 本地同步更新（如切换 llmSource 后） */
   setUser: (u: Partial<User>) => void;
+  /** 调用后端 /auth/me 更新基本信息（姓名/手机号/头像） */
+  updateProfile: (payload: { name?: string; phone?: string; avatar?: string }) => Promise<void>;
 }
 
 const mapUser = (u: AuthUser): User => ({
   id: u.id,
   name: u.name,
   email: u.email,
+  phone: u.phone ?? null,
+  avatar: u.avatar ?? null,
   company: u.company || '未加入公司',
   companyId: u.company_id ?? undefined,
   role: u.role,
@@ -60,10 +67,13 @@ export const useAuthStore = create<AuthState>((set) => ({
     set({ loading: true });
     try {
       const u = await authApi.getMe();
-      set({ user: mapUser(u), loading: false });
+      const mapped = mapUser(u);
+      set({ user: mapped, loading: false });
+      useUiStore.getState().bindUser(mapped.id);
     } catch {
       storage.remove('token');
       set({ user: null, loading: false });
+      useUiStore.getState().bindUser(null);
     }
   },
 
@@ -71,14 +81,18 @@ export const useAuthStore = create<AuthState>((set) => ({
     const r = await authApi.login({ email, password });
     storage.set('token', r.access_token);
     reset401Warning();
-    set({ user: mapUser(r.user) });
+    const mapped = mapUser(r.user);
+    set({ user: mapped });
+    useUiStore.getState().bindUser(mapped.id);
   },
 
   register: async (payload) => {
     const r = await authApi.register(payload);
     storage.set('token', r.access_token);
     reset401Warning();
-    set({ user: mapUser(r.user) });
+    const mapped = mapUser(r.user);
+    set({ user: mapped });
+    useUiStore.getState().bindUser(mapped.id);
   },
 
   logout: () => {
@@ -86,7 +100,13 @@ export const useAuthStore = create<AuthState>((set) => ({
     reset401Warning();
     useChatStore.getState().reset();
     set({ user: null });
+    useUiStore.getState().bindUser(null);
   },
 
   setUser: (u) => set((s) => (s.user ? { user: { ...s.user, ...u } } : s)),
+
+  updateProfile: async (payload) => {
+    const u = await authApi.updateProfile(payload);
+    set((s) => (s.user ? { user: mapUser(u) } : s));
+  },
 }));

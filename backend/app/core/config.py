@@ -3,7 +3,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    # 数据库连接串（开发环境 SQLite）
+    # 数据库连接串（开发环境默认 SQLite；生产多用户建议 PostgreSQL，在 .env 中覆盖即可）
     DATABASE_URL: str = "sqlite:///./law_agent.db"
     # JWT
     SECRET_KEY: str = "change-me-to-a-random-secret-key"
@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     MINIO_SECRET_KEY: str = "minioadmin"
     MINIO_BUCKET: str = "law-agent"
     MINIO_SECURE: bool = False
-    # LangGraph 检查点保存器类型：memory(默认)/sqlite/postgres
+    # LangGraph 检查点保存器类型：memory(默认,开发)/sqlite/postgres(生产)
     CHECKPOINTER_TYPE: str = "memory"
     # SQLite 检查点文件路径（CHECKPOINTER_TYPE=sqlite 时生效）
     CHECKPOINTER_SQLITE_PATH: str = "checkpoints.db"
