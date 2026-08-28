@@ -41,7 +41,8 @@ with engine.connect() as conn:
             if column not in cols:
                 conn.execute(text(ddl))
 
-    _ensure_column("users", "is_developer", "ALTER TABLE users ADD COLUMN is_developer BOOLEAN DEFAULT 0")
+    # BOOLEAN DEFAULT FALSE 兼容 PostgreSQL 与 SQLite（PG 的 BOOLEAN 不接受整数 0）
+    _ensure_column("users", "is_developer", "ALTER TABLE users ADD COLUMN is_developer BOOLEAN DEFAULT FALSE")
     _ensure_column("admin_requests", "company_id", "ALTER TABLE admin_requests ADD COLUMN company_id INTEGER")
     conn.commit()
 
