@@ -123,16 +123,20 @@ def _gen_invite_code(length: int = 8) -> str:
 
 def _user_out(user: User, db: Session) -> UserOut:
     company_name: Optional[str] = None
+    company_id = user.company_id
     if user.company_id:
         company = db.get(Company, user.company_id)
         if company:
             company_name = company.name
+        else:
+            # 公司记录不存在（孤儿引用），清空 company_id 避免前端显示矛盾
+            company_id = None
     return UserOut(
         id=user.id,
         name=user.name,
         email=user.email,
         company=company_name,
-        company_id=user.company_id,
+        company_id=company_id,
         role=user.role,
         avatar=user.avatar,
         is_admin=user.is_admin,
