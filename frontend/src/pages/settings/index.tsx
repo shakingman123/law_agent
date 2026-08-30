@@ -22,6 +22,7 @@ import {
 import { UserOutlined, BgColorsOutlined, HomeOutlined, ApiOutlined, UploadOutlined, CrownOutlined, LogoutOutlined, CopyOutlined, ReloadOutlined, TeamOutlined, CheckOutlined, CloseOutlined } from '@ant-design/icons';
 import type { UploadFile } from 'antd';
 import { useAuthStore } from '../../stores/authStore';
+import { useLlmStore } from '../../stores/llmStore';
 import { useUiStore, type FontSize, type BgTheme } from '../../stores/uiStore';
 import { colors } from '../../theme/tokens';
 import LlmApiPanel from '../../components/settings/LlmApiPanel';
@@ -533,7 +534,6 @@ export default function Settings() {
                               llmSource: 'personal',
                             });
                             // 重新拉取 LLM 配置（公司配置立即失效）
-                            const { useLlmStore } = await import('../../stores/llmStore');
                             await useLlmStore.getState().loadAll(false);
                             message.success('已退出公司');
                           } catch {

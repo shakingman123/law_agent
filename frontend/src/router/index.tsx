@@ -1,11 +1,7 @@
+import { lazy, Suspense } from 'react';
 import { createHashRouter, Navigate } from 'react-router-dom';
+import { Spin } from 'antd';
 import AppLayout from '../layouts/AppLayout';
-import Workbench from '../pages/workbench';
-import Calendar from '../pages/calendar';
-import DocLib from '../pages/doclib';
-import CaseDetail from '../pages/case-detail';
-import Settings from '../pages/settings';
-import Developer from '../pages/developer';
 
 /**
  * 路由配置
@@ -14,20 +10,37 @@ import Developer from '../pages/developer';
  * 案件详情页从工作台案件栏或文档库进入
  * /developer 为平台开发者控制台（独立布局，仅开发者可进）
  *
- * 后续若需按页拆 bundle，将页面改为 lazy() + Suspense 即可
+ * 页面组件全部 React.lazy 懒加载：按路由自动代码分割，首屏只加载工作台所需代码
  */
+function PageLoading() {
+  return (
+    <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '60vh' }}>
+      <Spin size="large" tip="加载中..." />
+    </div>
+  );
+}
+
+const lazyPage = (loader: () => Promise<{ default: React.ComponentType }>) => {
+  const Page = lazy(loader);
+  return (
+    <Suspense fallback={<PageLoading />}>
+      <Page />
+    </Suspense>
+  );
+};
+
 export const router = createHashRouter([
   {
     path: '/',
     element: <AppLayout />,
     children: [
       { index: true, element: <Navigate to="/workbench" replace /> },
-      { path: 'workbench', element: <Workbench /> },
-      { path: 'calendar', element: <Calendar /> },
-      { path: 'doclib', element: <DocLib /> },
-      { path: 'cases/:id', element: <CaseDetail /> },
-      { path: 'settings', element: <Settings /> },
+      { path: 'workbench', element: lazyPage(() => import('../pages/workbench')) },
+      { path: 'calendar', element: lazyPage(() => import('../pages/calendar')) },
+      { path: 'doclib', element: lazyPage(() => import('../pages/doclib')) },
+      { path: 'cases/:id', element: lazyPage(() => import('../pages/case-detail')) },
+      { path: 'settings', element: lazyPage(() => import('../pages/settings')) },
     ],
   },
-  { path: '/developer', element: <Developer /> },
+  { path: '/developer', element: lazyPage(() => import('../pages/developer')) },
 ]);

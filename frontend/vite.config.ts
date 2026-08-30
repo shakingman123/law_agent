@@ -10,6 +10,17 @@ export default defineConfig({
       '@': path.resolve(__dirname, 'src'),
     },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        // 手动分包：大体积第三方库拆为独立 chunk，利用浏览器长缓存
+        manualChunks: {
+          react: ['react', 'react-dom', 'react-router-dom'],
+          antd: ['antd', '@ant-design/icons'],
+        },
+      },
+    },
+  },
   server: {
     port: 5173,
     host: true,
