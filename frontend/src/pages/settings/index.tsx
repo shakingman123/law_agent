@@ -11,7 +11,6 @@ import {
   Space,
   Divider,
   App,
-  Switch,
   Upload,
   Tag,
   Alert,
@@ -524,9 +523,22 @@ export default function Settings() {
                       </div>
                       <Button
                         danger
-                        onClick={() => {
-                          message.success('已退出公司');
-                          setUser({ company: '未加入公司', companyId: undefined, isAdmin: false });
+                        onClick={async () => {
+                          try {
+                            await authApi.leaveCompany();
+                            setUser({
+                              company: '未加入公司',
+                              companyId: undefined,
+                              isAdmin: false,
+                              llmSource: 'personal',
+                            });
+                            // 重新拉取 LLM 配置（公司配置立即失效）
+                            const { useLlmStore } = await import('../../stores/llmStore');
+                            await useLlmStore.getState().loadAll(false);
+                            message.success('已退出公司');
+                          } catch {
+                            /* 拦截器已提示 */
+                          }
                         }}
                       >
                         退出公司
@@ -798,29 +810,6 @@ export default function Settings() {
 
             {section === 'llm' && (
               <div>
-                <div
-                  style={{
-                    marginBottom: 16,
-                    padding: '8px 12px',
-                    background: colors.primaryBg,
-                    borderRadius: 8,
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 8,
-                    fontSize: 12,
-                    color: colors.muted,
-                  }}
-                >
-                  <Switch
-                    size="small"
-                    checked={user.isAdmin}
-                    onChange={(v) => {
-                      setUser({ isAdmin: v });
-                      message.success(`已切换为${v ? '管理员' : '员工'}视角（演示）`);
-                    }}
-                  />
-                  <span>切换管理员视角（演示用）：{user.isAdmin ? '管理员' : '员工'}</span>
-                </div>
                 <LlmApiPanel />
               </div>
             )}

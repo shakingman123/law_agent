@@ -213,29 +213,38 @@ export default function LlmApiPanel() {
         模型与 API
       </Typography.Title>
 
-      {/* ===== 使用方式切换 ===== */}
+      {/* ===== 使用方式（管理员可切换；员工按授权自动生效） ===== */}
       <Card size="small" style={{ marginBottom: 16 }}>
         <Space direction="vertical" style={{ width: '100%' }}>
           <Typography.Text strong>当前使用方式</Typography.Text>
-          <Segmented
-            value={user.llmSource}
-            onChange={(v) => handleSwitchSource(v as 'company' | 'personal')}
-            options={[
-              {
-                label: `公司 API${companyUsable ? '' : '（未可用）'}`,
-                value: 'company',
-                disabled: !companyUsable,
-              },
-              {
-                label: `个人 API${personalUsable ? '' : '（未配置）'}`,
-                value: 'personal',
-                disabled: !personalUsable,
-              },
-            ]}
-          />
-          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            优先级：个人 API &gt; 公司 API。个人调用不计入公司额度。
-          </Typography.Text>
+          {user.isAdmin ? (
+            <>
+              <Segmented
+                value={user.llmSource}
+                onChange={(v) => handleSwitchSource(v as 'company' | 'personal')}
+                options={[
+                  {
+                    label: `公司 API${companyUsable ? '' : '（未可用）'}`,
+                    value: 'company',
+                    disabled: !companyUsable,
+                  },
+                  {
+                    label: `个人 API${personalUsable ? '' : '（未配置）'}`,
+                    value: 'personal',
+                    disabled: !personalUsable,
+                  },
+                ]}
+              />
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                优先级：个人 API &gt; 公司 API。个人调用不计入公司额度。
+              </Typography.Text>
+            </>
+          ) : (
+            <Typography.Text type="secondary">
+              由系统自动分配：已获授权且公司 API 可用时优先公司额度，否则使用您配置的个人 API
+              （员工无需手动切换）。
+            </Typography.Text>
+          )}
         </Space>
       </Card>
 
@@ -310,9 +319,9 @@ export default function LlmApiPanel() {
                 {company.apiKeyMasked || '—（管理员未配置）'}
               </Descriptions.Item>
             </Descriptions>
-            {companyUsable && !accessRequest && (
+            {companyUsable && (!accessRequest || accessRequest.status === 'rejected') && (
               <Button type="primary" onClick={handleRequest}>
-                申请使用公司 API
+                {accessRequest?.status === 'rejected' ? '重新申请使用公司 API' : '申请使用公司 API'}
               </Button>
             )}
             {accessRequest && (

@@ -160,6 +160,9 @@ export const authApi = {
       .post<JoinRequest>(`/auth/company/join-requests/${reqId}/reject`)
       .then((r) => r.data),
 
+  // 员工退出当前公司（后端清空 company_id 并重置 llm_source）
+  leaveCompany: () => request.post<{ ok: boolean }>('/auth/company/leave').then((r) => r.data),
+
   // ---- 开发者控制台 ----
   devOverview: () =>
     request.get<DevOverview>('/dev/overview').then((r) => r.data),

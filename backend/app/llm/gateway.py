@@ -19,6 +19,7 @@ from app.core.config import settings
 from app.core.security import decrypt_api_key, mask_api_key
 from app.models.llm import (
     CompanyLlmConfig,
+    LlmAccessRequest,
     LlmQuota,
     LlmUsageRecord,
     UserLlmConfig,
@@ -65,67 +66,97 @@ def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> fl
 class LLMGateway:
     """所有 Agent 只依赖这个类，不直接接触 Key。"""
 
+    def _company_authorized(self, user: User, db: Session) -> bool:
+        """员工使用公司 API 需审批通过；管理员天然有权限。"""
+        if user.is_admin:
+            return True
+        if not user.company_id:
+            return False
+        approved = (
+            db.query(LlmAccessRequest)
+            .filter_by(
+                user_id=user.id,
+                company_id=user.company_id,
+                status="approved",
+            )
+            .first()
+        )
+        return approved is not None
+
     def resolve_config(self, user: User, db: Session) -> ResolvedConfig:
-        """按优先级解析生效的 LLM 配置。"""
+        """按优先级解析生效的 LLM 配置。
+
+        - 所选源优先，另一源兜底（双向降级）
+        - 公司 API 仅对公司成员开放，且员工需审批通过（管理员豁免）
+        """
         logger.info(
             "[resolve_config] 开始解析 LLM 配置: user_id=%s, llm_source=%s, company_id=%s",
             user.id, user.llm_source, user.company_id,
         )
 
-        # 1. 个人 API（员工启用 personal 时优先）
-        if user.llm_source == "personal":
-            cfg = (
-                db.query(UserLlmConfig)
-                .filter_by(user_id=user.id, is_active=True)
-                .first()
-            )
-            logger.debug(
-                "[resolve_config] 查询个人配置: user_id=%s, 命中=%s, is_active=%s, has_key=%s",
-                user.id, bool(cfg), getattr(cfg, "is_active", None), bool(getattr(cfg, "api_key_enc", None)),
-            )
-            if cfg and cfg.api_key_enc:
-                logger.info(
-                    "[resolve_config] 命中个人 API: provider=%s, models=%s",
-                    cfg.provider, cfg.models,
-                )
-                return ResolvedConfig(
-                    source="personal",
-                    provider=cfg.provider,
-                    base_url=cfg.base_url or "",
-                    api_key=decrypt_api_key(cfg.api_key_enc),
-                    models=cfg.models or [],
-                )
-            logger.warning("[resolve_config] 用户 llm_source=personal 但个人配置不可用，降级到公司 API")
+        personal_cfg = (
+            db.query(UserLlmConfig)
+            .filter_by(user_id=user.id, is_active=True)
+            .first()
+        )
+        personal_ok = bool(personal_cfg and personal_cfg.api_key_enc)
 
-        # 2. 公司 API（管理员配置且启用）
+        company_cfg = None
+        company_ok = False
         if user.company_id:
-            cfg = (
+            company_cfg = (
                 db.query(CompanyLlmConfig)
                 .filter_by(company_id=user.company_id, is_active=True)
                 .first()
             )
-            logger.debug(
-                "[resolve_config] 查询公司配置: company_id=%s, 命中=%s, is_active=%s, has_key=%s",
-                user.company_id, bool(cfg), getattr(cfg, "is_active", None), bool(getattr(cfg, "api_key_enc", None)),
-            )
-            if cfg and cfg.api_key_enc:
+            authorized = self._company_authorized(user, db)
+            company_ok = bool(company_cfg and company_cfg.api_key_enc and authorized)
+            if company_cfg and company_cfg.api_key_enc and not authorized:
                 logger.info(
-                    "[resolve_config] 命中公司 API: provider=%s, models=%s, monthly_budget=%s",
-                    cfg.provider, cfg.models, cfg.monthly_budget,
+                    "[resolve_config] 公司 API 已配置但用户未获授权（需审批通过）: user_id=%s",
+                    user.id,
                 )
-                return ResolvedConfig(
-                    source="company",
-                    provider=cfg.provider,
-                    base_url=cfg.base_url or "",
-                    api_key=decrypt_api_key(cfg.api_key_enc),
-                    models=cfg.models or [],
-                )
-            logger.warning(
-                "[resolve_config] 公司 API 不可用: company_id=%s, 命中=%s",
-                user.company_id, bool(cfg),
+
+        def _personal() -> ResolvedConfig:
+            assert personal_cfg is not None
+            return ResolvedConfig(
+                source="personal",
+                provider=personal_cfg.provider,
+                base_url=personal_cfg.base_url or "",
+                api_key=decrypt_api_key(personal_cfg.api_key_enc),
+                models=personal_cfg.models or [],
             )
 
-        # 3. 平台开发者 Key（仅开发兜底）
+        def _company() -> ResolvedConfig:
+            assert company_cfg is not None
+            return ResolvedConfig(
+                source="company",
+                provider=company_cfg.provider,
+                base_url=company_cfg.base_url or "",
+                api_key=decrypt_api_key(company_cfg.api_key_enc),
+                models=company_cfg.models or [],
+            )
+
+        # 1. 用户所选源优先，不可用时双向降级
+        if user.llm_source == "personal":
+            if personal_ok:
+                logger.info("[resolve_config] 命中个人 API: provider=%s", personal_cfg.provider)
+                return _personal()
+            if company_ok:
+                logger.info("[resolve_config] 个人 API 不可用，降级到公司 API")
+                return _company()
+        else:
+            if company_ok:
+                logger.info(
+                    "[resolve_config] 命中公司 API: provider=%s, models=%s, monthly_budget=%s",
+                    company_cfg.provider, company_cfg.models, company_cfg.monthly_budget,
+                )
+                return _company()
+            if personal_ok:
+                logger.info("[resolve_config] 公司 API 不可用，降级到个人 API")
+                return _personal()
+
+        # 2. 平台开发者 Key（仅开发兜底）
         if PLATFORM_LLM_KEY:
             logger.warning(
                 "[resolve_config] 降级使用平台开发者 Key（仅开发环境）: base=%s, model=%s",

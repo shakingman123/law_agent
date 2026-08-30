@@ -253,6 +253,23 @@ def create_access_request(
     return _access_request_out(req, db)
 
 
+@router.get("/access-request/me", response_model=Optional[AccessRequestOut])
+def get_my_access_request(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """当前员工在本公司最近一次公司 API 使用申请（无申请返回 null）。"""
+    if not user.company_id:
+        return None
+    req = (
+        db.query(LlmAccessRequest)
+        .filter_by(user_id=user.id, company_id=user.company_id)
+        .order_by(LlmAccessRequest.id.desc())
+        .first()
+    )
+    return _access_request_out(req, db) if req else None
+
+
 @router.get("/access-requests", response_model=list[AccessRequestOut])
 def list_access_requests(
     status_filter: Optional[str] = Query(None, alias="status"),

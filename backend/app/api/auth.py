@@ -495,3 +495,24 @@ def reject_join_request(
     req["status"] = "rejected"
     req["reviewed_at"] = datetime.utcnow()
     return JoinRequestOut(**req)
+
+
+@router.post("/company/leave")
+def leave_company(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """员工退出当前公司。
+
+    退出后：
+    - company_id 清空，立即失去公司 API 使用资格（网关按 company_id + 审批校验）
+    - llm_source 重置为 personal，避免残留的公司指向
+    """
+    if not user.company_id:
+        raise HTTPException(status_code=400, detail="您尚未加入公司")
+    if user.is_admin:
+        raise HTTPException(status_code=400, detail="公司管理员暂不支持退出公司")
+    user.company_id = None
+    user.llm_source = "personal"
+    db.commit()
+    return {"ok": True}

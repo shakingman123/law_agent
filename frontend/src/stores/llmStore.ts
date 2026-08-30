@@ -186,7 +186,7 @@ export const useLlmStore = create<LlmState>((set, get) => ({
       if (personal) next.personalConfig = mapPersonal(personal);
       if (myUsage) next.myUsage = mapMyUsage(myUsage);
 
-      // 管理员额外加载全员用量与待审批
+      // 管理员额外加载全员用量与待审批；员工加载自己的申请状态
       if (isAdmin) {
         const [usage, requests] = await Promise.all([
           llmApi.getCompanyUsage().catch(() => []),
@@ -199,6 +199,9 @@ export const useLlmStore = create<LlmState>((set, get) => ({
           // 取第一条作为 accessRequest 兼容旧 UI（后续应改为列表渲染）
           next.accessRequest = mapAccess(pending[0]);
         }
+      } else {
+        const mine = await llmApi.getMyAccessRequest().catch(() => null);
+        if (mine) next.accessRequest = mapAccess(mine);
       }
       set(next);
     } catch {

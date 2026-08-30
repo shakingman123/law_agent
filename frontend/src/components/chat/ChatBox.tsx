@@ -51,7 +51,7 @@ interface Attachment {
  */
 export default function ChatBox() {
   const { user } = useAuthStore();
-  const { companyConfig, personalConfig, loadAll } = useLlmStore();
+  const { companyConfig, personalConfig, accessRequest, loadAll } = useLlmStore();
   const { getCurrentCase } = useCaseStore();
   const { messages, currentConversationId, loading, init, appendLocalMessage, updateLastAgentMessage } =
     useChatStore();
@@ -80,7 +80,9 @@ export default function ChatBox() {
     }
   }, [user, loadAll, init]);
 
-  const hasCompanyApi = !!companyConfig?.isActive;
+  // 公司 API 可用 = 已加入公司 + 配置启用 + （管理员 或 申请已审批通过）
+  const companyAuthorized = !!user?.isAdmin || accessRequest?.status === 'approved';
+  const hasCompanyApi = !!companyConfig?.isActive && !!user?.companyId && companyAuthorized;
   const hasPersonalApi = !!personalConfig?.isActive;
   const llmReady = hasCompanyApi || hasPersonalApi;
 

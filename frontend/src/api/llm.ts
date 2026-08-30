@@ -84,15 +84,19 @@ export interface MyUsageResponse {
 }
 
 export const llmApi = {
-  // 公司配置
+  // 公司配置（未配置时后端 404 属正常状态，silent 跳过全局错误弹窗）
   getCompanyConfig: () =>
-    request.get<CompanyLlmConfig>('/llm/config/company').then((r) => r.data),
+    request
+      .get<CompanyLlmConfig>('/llm/config/company', { silent: true })
+      .then((r) => r.data),
   saveCompanyConfig: (payload: SaveCompanyConfigPayload) =>
     request.put<CompanyLlmConfig>('/llm/config/company', payload).then((r) => r.data),
 
-  // 个人配置
+  // 个人配置（同上，未配置时 silent）
   getPersonalConfig: () =>
-    request.get<PersonalLlmConfig>('/llm/config/me').then((r) => r.data),
+    request
+      .get<PersonalLlmConfig>('/llm/config/me', { silent: true })
+      .then((r) => r.data),
   savePersonalConfig: (payload: SavePersonalConfigPayload) =>
     request.put<PersonalLlmConfig>('/llm/config/me', payload).then((r) => r.data),
 
@@ -105,6 +109,12 @@ export const llmApi = {
   // 申请使用公司 API
   createAccessRequest: (reason?: string) =>
     request.post<AccessRequest>('/llm/access-request', { reason }).then((r) => r.data),
+
+  // 我的最近一次公司 API 使用申请（未申请/未加入公司返回 null）
+  getMyAccessRequest: () =>
+    request
+      .get<AccessRequest | null>('/llm/access-request/me', { silent: true })
+      .then((r) => r.data),
 
   // 管理员：待审批列表
   listAccessRequests: () =>
