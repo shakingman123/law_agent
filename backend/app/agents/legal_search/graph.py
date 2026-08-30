@@ -29,15 +29,26 @@ class SearchState(TypedDict, total=False):
     citations: list[dict]        # 引用（≤10 条）
 
 
-def build_search_graph(user: User, db: Session):
+def build_search_graph(user: User, db: Session, _report=None):
+    """构建法律检索图。
+
+    _report: 可选 StageReport，逐节点计时（rewrite/retrieve/synthesize）。
+    """
     llm = gateway.get_chat_model(user, db, temperature=0.2)
 
     async def rewrite_node(state: SearchState) -> dict:
         """查询改写：生成更利于检索的法律查询。"""
-        resp = await llm.ainvoke([
-            SystemMessage(content="改写用户法律问题为更精准的检索查询，只返回查询语句。"),
-            HumanMessage(content=state["query"]),
-        ])
+        if _report:
+            async with _report.stage("LLM改写"):
+                resp = await llm.ainvoke([
+                    SystemMessage(content="改写用户法律问题为更精准的检索查询，只返回查询语句。"),
+                    HumanMessage(content=state["query"]),
+                ])
+        else:
+            resp = await llm.ainvoke([
+                SystemMessage(content="改写用户法律问题为更精准的检索查询，只返回查询语句。"),
+                HumanMessage(content=state["query"]),
+            ])
         return {"rewritten_query": resp.content.strip()}
 
     async def retrieve_node(state: SearchState) -> dict:
@@ -47,7 +58,13 @@ def build_search_graph(user: User, db: Session):
         Qdrant 不可用时自动回退到 ChromaDB。
         """
         query = state.get("rewritten_query") or state.get("query", "")
-        results = search_multi(query)
+        if _report:
+            # search_multi 是同步阻塞调用，放到线程里避免卡事件循环
+            import asyncio
+
+            results = await asyncio.to_thread(search_multi, query, None, _report)
+        else:
+            results = search_multi(query)
         return {"raw_results": results}
 
     async def rerank_node(state: SearchState) -> dict:
@@ -59,7 +76,7 @@ def build_search_graph(user: User, db: Session):
         """总分结构输出：先结论后展开，引用可点击跳转。"""
         refs = state.get("reranked", [])
         refs_text = "\n".join(f"[{i+1}] {r['title']}: {r['content']}" for i, r in enumerate(refs))
-        resp = await llm.ainvoke([
+        messages = [
             SystemMessage(
                 content=(
                     "你是法律检索助手。根据检索结果回答问题。\n"
@@ -74,7 +91,12 @@ def build_search_graph(user: User, db: Session):
                 )
             ),
             HumanMessage(content=f"问题：{state['query']}\n\n检索结果：\n{refs_text}"),
-        ])
+        ]
+        if _report:
+            async with _report.stage("LLM综合生成"):
+                resp = await llm.ainvoke(messages)
+        else:
+            resp = await llm.ainvoke(messages)
         return {
             "answer": resp.content,
             "citations": [{"index": i + 1, **r} for i, r in enumerate(refs)],

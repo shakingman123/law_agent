@@ -20,6 +20,13 @@ from app.core.config import settings
 
 logger = logging.getLogger("app.rag")
 
+
+def _noop():
+    """空上下文：未传计时报告时的占位。"""
+    from contextlib import nullcontext
+
+    return nullcontext()
+
 # Qdrant 集合 → 来源标签映射
 COLLECTION_LABELS = {
     settings.QDRANT_COLLECTION_LAW: "法条",
@@ -131,8 +138,12 @@ def search(
     collection: str = settings.QDRANT_COLLECTION_LAW,
     top_k: Optional[int] = None,
     source_label: str = "",
+    _report=None,
 ) -> list[dict]:
-    """检索单个集合，返回 [{source, title, content, score}]。"""
+    """检索单个集合，返回 [{source, title, content, score}]。
+
+    _report: 可选 StageReport，用于分段计时诊断（embed/远端检索/回退）。
+    """
     if not query or not query.strip():
         return []
 
@@ -152,16 +163,19 @@ def search(
 
     client = _get_client()
     if client is None:
-        return _fallback_chroma()
+        with (_report.child(label, "chroma回退") if _report else _noop()):
+            return _fallback_chroma()
 
     try:
-        vector = _embed(query)
-        hits = client.search(
-            collection_name=collection,
-            query_vector=vector,
-            limit=k,
-            with_payload=True,
-        )
+        with (_report.child(label, "embed") if _report else _noop()):
+            vector = _embed(query)
+        with (_report.child(label, "qdrant搜索") if _report else _noop()):
+            hits = client.search(
+                collection_name=collection,
+                query_vector=vector,
+                limit=k,
+                with_payload=True,
+            )
         out = []
         for hit in hits:
             payload = hit.payload or {}
@@ -181,18 +195,20 @@ def search(
 def search_multi(
     query: str,
     top_k: Optional[int] = None,
+    _report=None,
 ) -> list[dict]:
     """多路并行检索：法条 / 判例 / 公众号，合并返回。
 
     每路取 top_k 条，合并后按 score 降序排列。
     使用线程池实现并行检索。
+    _report: 可选 StageReport，计时细分到每一路（embed/qdrant搜索/回退）。
     """
     from concurrent.futures import ThreadPoolExecutor
 
     k = top_k or settings.RAG_TOP_K
 
     def _do_search(collection: str, label: str) -> list[dict]:
-        return search(query, collection=collection, top_k=k, source_label=label)
+        return search(query, collection=collection, top_k=k, source_label=label, _report=_report)
 
     all_hits = []
     with ThreadPoolExecutor(max_workers=3) as executor:

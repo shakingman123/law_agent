@@ -10,6 +10,7 @@ LangGraph 的 interrupt 在 review 节点暂停，invoke 自动返回当前状�
 import asyncio
 import json
 import logging
+import time
 import uuid
 from datetime import datetime
 
@@ -21,6 +22,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.deps import get_current_user
 from app.core.database import SessionLocal
+from app.core.timing import StageReport
 from app.models.user import User
 from app.models.conversation import Conversation, Message
 from app.agents.drafting import build_draft_graph
@@ -117,8 +119,9 @@ async def start_draft(
     运行图直到 review 节点的 interrupt 暂停，返回草稿供前端预览。
     若中途出错（如额度不足、无可用 LLM 配置），直接返回错误。
     """
+    report = StageReport("start_draft")
     try:
-        graph = build_draft_graph(user, db)
+        graph = build_draft_graph(user, db, _report=report)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -136,9 +139,13 @@ async def start_draft(
     }
 
     try:
-        result = await graph.ainvoke(initial_state, config=config)
+        with report.stage("LangGraph执行"):
+            result = await graph.ainvoke(initial_state, config=config)
     except Exception as e:  # noqa: BLE001
+        report.finish(extra="结果=失败")
         raise HTTPException(status_code=500, detail=f"流程执行失败：{e}")
+
+    report.finish(extra=f"草稿长度={len(result.get('draft', '') or '')}")
 
     logger.info(
         "[start_draft] 流程执行完成: thread_id=%s, draft_len=%d, draft_preview=%r, error=%r",
@@ -164,8 +171,9 @@ async def resume_draft(
     - 通过 aupdate_state 写入 confirmed/user_feedback
     - 再 ainvoke(None) 继续执行 review → finalize（或 draft 重生成）
     """
+    report = StageReport("resume_draft")
     try:
-        graph = build_draft_graph(user, db)
+        graph = build_draft_graph(user, db, _report=report)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -183,10 +191,13 @@ async def resume_draft(
     )
 
     try:
-        result = await graph.ainvoke(None, config=config)
+        with report.stage("LangGraph恢复执行"):
+            result = await graph.ainvoke(None, config=config)
     except Exception as e:  # noqa: BLE001
+        report.finish(extra="结果=失败")
         raise HTTPException(status_code=500, detail=f"恢复执行失败：{e}")
 
+    report.finish(extra=f"草稿长度={len(result.get('draft', '') or '')}")
     return _build_response(thread_id, result, graph, config)
 
 
@@ -204,39 +215,42 @@ async def chat_message(
     - 截断的旧消息仍在 DB 与 UI 中可见，只是不进 LLM 上下文
     - LLM 未配置时仍存用户消息并返回 RAG 来源
     """
+    report = StageReport("chat_message", msg_id=payload.conversation_id)
     # ① 解析/创建会话
-    conv = None
-    if payload.conversation_id:
-        conv = db.get(Conversation, payload.conversation_id)
-        if not conv or conv.user_id != user.id:
-            raise HTTPException(status_code=404, detail="会话不存在")
-    if conv is None:
-        conv = (
-            db.query(Conversation)
-            .filter_by(user_id=user.id)
-            .order_by(Conversation.last_message_at.desc())
-            .first()
-        )
+    with report.stage("会话解析"):
+        conv = None
+        if payload.conversation_id:
+            conv = db.get(Conversation, payload.conversation_id)
+            if not conv or conv.user_id != user.id:
+                raise HTTPException(status_code=404, detail="会话不存在")
         if conv is None:
-            conv = Conversation(user_id=user.id, title=payload.message[:20] or "新对话")
-            db.add(conv)
-            db.commit()
-            db.refresh(conv)
+            conv = (
+                db.query(Conversation)
+                .filter_by(user_id=user.id)
+                .order_by(Conversation.last_message_at.desc())
+                .first()
+            )
+            if conv is None:
+                conv = Conversation(user_id=user.id, title=payload.message[:20] or "新对话")
+                db.add(conv)
+                db.commit()
+                db.refresh(conv)
 
     # ② 存用户消息（无论 LLM 是否可用都先存）
-    user_msg = Message(
-        conversation_id=conv.id,
-        role="user",
-        content=payload.message,
-        attachments=[{"url": u} for u in payload.attachments],
-    )
-    db.add(user_msg)
-    # 首条消息更新会话标题
-    if conv.title in ("新对话", "") and payload.message:
-        conv.title = payload.message[:20]
-    conv.last_message_at = datetime.utcnow()
-    db.commit()
-    db.refresh(user_msg)
+    with report.stage("用户消息落库"):
+        user_msg = Message(
+            conversation_id=conv.id,
+            role="user",
+            content=payload.message,
+            attachments=[{"url": u} for u in payload.attachments],
+        )
+        db.add(user_msg)
+        # 首条消息更新会话标题
+        if conv.title in ("新对话", "") and payload.message:
+            conv.title = payload.message[:20]
+        conv.last_message_at = datetime.utcnow()
+        db.commit()
+        db.refresh(user_msg)
 
     # ③ RAG 检索（先于 LLM 检查，确保即使无 LLM 也能返回检索结果）
     # rag_sources 存结构化引用：[{index, title, source, content}]
@@ -244,7 +258,8 @@ async def chat_message(
     context_block = ""
     if payload.use_rag:
         try:
-            hits = retrieve(payload.message)
+            with report.stage("RAG检索"):
+                hits = retrieve(payload.message, _report=report)
             if hits:
                 context_block = "\n\n【知识库参考资料】\n" + "\n---\n".join(
                     f"[{i+1}] 来源：{h.get('source', '未知')}\n{h.get('content', '')}"
@@ -274,6 +289,7 @@ async def chat_message(
         cfg = gateway.resolve_config(user, db)
         llm = gateway.get_chat_model(user, db, temperature=0.4)
     except RuntimeError as e:
+        report.finish(extra="结果=LLM未配置")
         return ChatMessageResponse(
             reply="",
             rag_sources=rag_sources,
@@ -316,11 +332,12 @@ async def chat_message(
 
     # ⑧ 调 LLM：system + 历史 N 轮 + 当前用户消息
     try:
-        resp = await llm.ainvoke([
-            SystemMessage(content=system_content),
-            *history_msgs,
-            HumanMessage(content=user_content),
-        ])
+        with report.stage("LLM生成"):
+            resp = await llm.ainvoke([
+                SystemMessage(content=system_content),
+                *history_msgs,
+                HumanMessage(content=user_content),
+            ])
         # 用量记账（失败不阻断对话回复）
         if resp.usage_metadata:
             try:
@@ -334,16 +351,18 @@ async def chat_message(
             except Exception:  # noqa: BLE001
                 logger.warning("[chat_message] 用量记账失败，不影响对话回复", exc_info=True)
         # ⑨ 存 agent 回复
-        agent_msg = Message(
-            conversation_id=conv.id,
-            role="agent",
-            content=resp.content,
-            rag_sources=rag_sources,
-        )
-        db.add(agent_msg)
-        conv.last_message_at = datetime.utcnow()
-        db.commit()
-        db.refresh(agent_msg)
+        with report.stage("回复落库"):
+            agent_msg = Message(
+                conversation_id=conv.id,
+                role="agent",
+                content=resp.content,
+                rag_sources=rag_sources,
+            )
+            db.add(agent_msg)
+            conv.last_message_at = datetime.utcnow()
+            db.commit()
+            db.refresh(agent_msg)
+        report.finish(extra=f"回复长度={len(resp.content)}")
         return ChatMessageResponse(
             reply=resp.content,
             rag_sources=rag_sources,
@@ -351,10 +370,12 @@ async def chat_message(
             message_id=agent_msg.id,
         )
     except QuotaExceeded as e:
+        report.finish(extra="结果=额度用尽")
         return ChatMessageResponse(
             error=str(e), rag_sources=rag_sources, conversation_id=conv.id
         )
     except Exception as e:  # noqa: BLE001
+        report.finish(extra="结果=异常")
         logger.exception("[chat_message] 对话调用失败: %s", e)
         raise HTTPException(status_code=500, detail=f"对话失败：{e}")
 
@@ -374,47 +395,51 @@ async def chat_stream(
 
     async def event_stream():
         db = SessionLocal()
+        report = StageReport("chat_stream", msg_id=payload.conversation_id)
         try:
             # ① 解析/创建会话
-            conv = None
-            if payload.conversation_id:
-                conv = db.get(Conversation, payload.conversation_id)
-                if not conv or conv.user_id != user.id:
-                    yield _sse_event({"type": "error", "error": "会话不存在"})
-                    return
-            if conv is None:
-                conv = (
-                    db.query(Conversation)
-                    .filter_by(user_id=user.id)
-                    .order_by(Conversation.last_message_at.desc())
-                    .first()
-                )
+            with report.stage("会话解析"):
+                conv = None
+                if payload.conversation_id:
+                    conv = db.get(Conversation, payload.conversation_id)
+                    if not conv or conv.user_id != user.id:
+                        yield _sse_event({"type": "error", "error": "会话不存在"})
+                        return
                 if conv is None:
-                    conv = Conversation(user_id=user.id, title=payload.message[:20] or "新对话")
-                    db.add(conv)
-                    db.commit()
-                    db.refresh(conv)
+                    conv = (
+                        db.query(Conversation)
+                        .filter_by(user_id=user.id)
+                        .order_by(Conversation.last_message_at.desc())
+                        .first()
+                    )
+                    if conv is None:
+                        conv = Conversation(user_id=user.id, title=payload.message[:20] or "新对话")
+                        db.add(conv)
+                        db.commit()
+                        db.refresh(conv)
 
             # ② 存用户消息
-            user_msg = Message(
-                conversation_id=conv.id,
-                role="user",
-                content=payload.message,
-                attachments=[{"url": u} for u in payload.attachments],
-            )
-            db.add(user_msg)
-            if conv.title in ("新对话", "") and payload.message:
-                conv.title = payload.message[:20]
-            conv.last_message_at = datetime.utcnow()
-            db.commit()
-            db.refresh(user_msg)
+            with report.stage("用户消息落库"):
+                user_msg = Message(
+                    conversation_id=conv.id,
+                    role="user",
+                    content=payload.message,
+                    attachments=[{"url": u} for u in payload.attachments],
+                )
+                db.add(user_msg)
+                if conv.title in ("新对话", "") and payload.message:
+                    conv.title = payload.message[:20]
+                conv.last_message_at = datetime.utcnow()
+                db.commit()
+                db.refresh(user_msg)
 
             # ③ RAG 检索（同步，放线程池）
             rag_sources: list[dict] = []
             context_block = ""
             if payload.use_rag:
                 try:
-                    hits = await asyncio.to_thread(retrieve, payload.message)
+                    with report.stage("RAG检索"):
+                        hits = await asyncio.to_thread(retrieve, payload.message, _report=report)
                     if hits:
                         context_block = "\n\n【知识库参考资料】\n" + "\n---\n".join(
                             f"[{i+1}] 来源：{h.get('source', '未知')}\n{h.get('content', '')}"
@@ -477,26 +502,36 @@ async def chat_stream(
             })
 
             full_parts: list[str] = []
+            ttft: float | None = None  # 首 token 等待时间
+            stream_start = time.perf_counter()
             async for chunk in llm.astream(messages):
                 token = getattr(chunk, "content", "") or ""
                 if isinstance(token, str) and token:
+                    if ttft is None:
+                        ttft = time.perf_counter() - stream_start
                     full_parts.append(token)
                     yield _sse_event({"type": "token", "content": token})
 
             reply = "".join(full_parts)
+            llm_total = time.perf_counter() - stream_start
 
             # ⑨ 存 agent 回复
-            agent_msg = Message(
-                conversation_id=conv.id,
-                role="agent",
-                content=reply,
-                rag_sources=rag_sources,
-            )
-            db.add(agent_msg)
-            conv.last_message_at = datetime.utcnow()
-            db.commit()
-            db.refresh(agent_msg)
+            with report.stage("回复落库"):
+                agent_msg = Message(
+                    conversation_id=conv.id,
+                    role="agent",
+                    content=reply,
+                    rag_sources=rag_sources,
+                )
+                db.add(agent_msg)
+                conv.last_message_at = datetime.utcnow()
+                db.commit()
+                db.refresh(agent_msg)
 
+            ttft_str = f"{ttft:.2f}s" if ttft is not None else "0(无输出)"
+            report.finish(
+                extra=f"LLM总耗时={llm_total:.2f}s 首token={ttft_str} 回复长度={len(reply)}"
+            )
             yield _sse_event({
                 "type": "done",
                 "message_id": agent_msg.id,
@@ -504,6 +539,7 @@ async def chat_stream(
             })
         except Exception as e:  # noqa: BLE001
             logger.exception("[chat_stream] 流式对话失败: %s", e)
+            report.finish(extra="结果=异常")
             yield _sse_event({"type": "error", "error": str(e)})
         finally:
             db.close()

@@ -23,6 +23,12 @@ _client: Optional[chromadb.PersistentClient] = None
 # 默认知识库集合名
 DEFAULT_COLLECTION = "knowledge_base"
 
+# 显式 embedding 函数：chroma 自带 ONNX MiniLM（本地缓存，不依赖 HuggingFace 在线下载）。
+# 必须显式指定——"default" EF 在不同进程可能解析到不同模型，导致查询向量与入库向量不一致。
+from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
+
+EMBEDDING_FN = ONNXMiniLM_L6_V2()
+
 # 文本切块器：500 字符，重叠 50
 _splitter = RecursiveCharacterTextSplitter(
     chunk_size=500,
@@ -42,8 +48,12 @@ def _get_client() -> chromadb.PersistentClient:
 
 def _get_collection(name: str = DEFAULT_COLLECTION):
     client = _get_client()
-    # 默认 embedding 函数为 sentence-transformers，首用时自动下载模型
-    return client.get_or_create_collection(name=name)
+    # 余弦空间 + 显式 embedding 函数 + 按相似度阈值过滤，避免不相关问题时仍返回参考资料
+    return client.get_or_create_collection(
+        name=name,
+        embedding_function=EMBEDDING_FN,
+        configuration={"hnsw": {"space": "cosine"}},
+    )
 
 
 def ingest_text(
@@ -115,19 +125,48 @@ def retrieve(
     query: str,
     top_k: Optional[int] = None,
     collection: str = DEFAULT_COLLECTION,
+    _report=None,
 ) -> list[dict]:
-    """检索与 query 最相关的文档片段，返回 [{content, source, ...}]。"""
+    """检索与 query 最相关的文档片段，返回 [{content, source, ...}]。
+
+    _report: 可选 StageReport，细分计时（chroma查询含 embed + 检索）。
+    """
     if not query or not query.strip():
         return []
     col = _get_collection(collection)
     k = top_k or settings.RAG_TOP_K
-    result = col.query(query_texts=[query], n_results=k)
+    if _report:
+        with _report.stage("chroma查询(含embed)"):
+            result = col.query(
+                query_texts=[query],
+                n_results=k,
+                include=["documents", "metadatas", "distances"],
+            )
+    else:
+        result = col.query(
+            query_texts=[query],
+            n_results=k,
+            include=["documents", "metadatas", "distances"],
+        )
     docs = result.get("documents", [[]])[0]
     metas = result.get("metadatas", [[]])[0]
+    dists = (result.get("distances") or [[]])[0]
     out = []
-    for doc, meta in zip(docs, metas):
+    for doc, meta, dist in zip(docs, metas, dists):
+        # 余弦距离超过阈值视为不相关（如闲聊），直接丢弃，避免乱给参考资料
+        if dist > settings.RAG_MAX_DISTANCE:
+            continue
         out.append({"content": doc, **(meta or {})})
-    logger.info("[rag] 检索完成: query=%r, hits=%d", query[:40], len(out))
+    dropped = len(docs) - len(out)
+    logger.info(
+        "[rag] 检索完成: query=%r, hits=%d, 过滤低相关=%d, 阈值=%.2f, 距离=%s, 集合数=%d",
+        query[:40],
+        len(out),
+        dropped,
+        settings.RAG_MAX_DISTANCE,
+        [f"{d:.3f}" for d in dists],
+        col.count(),
+    )
     return out
 
 

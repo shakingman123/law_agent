@@ -125,16 +125,28 @@ class DraftState(TypedDict, total=False):
     error: str
 
 
-def build_draft_graph(user: User, db: Session):
+def build_draft_graph(user: User, db: Session, _report=None):
     """构造编译好的文书撰写图。
 
     每次对话请求构造一个图实例，节点闭包捕获 user/db，
     通过 LLMGateway 取 ChatModel（不直接接触 Key）。
+    _report: 可选 StageReport，逐节点计时（intent/collect/draft/finalize）。
     """
+    from contextlib import asynccontextmanager
+
     logger.info("[build_draft_graph] 构造图实例: user_id=%s", user.id)
     cfg = gateway.resolve_config(user, db)
     llm = gateway.get_chat_model(user, db, temperature=0.4)
     logger.info("[build_draft_graph] ChatModel 就绪: model=%s", llm.model_name)
+
+    @asynccontextmanager
+    async def timed(name: str):
+        """有计时报告时记录分段，否则直通。"""
+        if _report:
+            async with _report.stage(name):
+                yield
+        else:
+            yield
 
     # -------- 节点 --------
 
@@ -144,17 +156,18 @@ def build_draft_graph(user: User, db: Session):
         logger.info("[intent_node] 入口: user_id=%s, input_preview=%r", user.id, user_input_preview)
         try:
             logger.debug("[intent_node] 调用 LLM 识别文书类型")
-            resp = await llm.ainvoke([
-                SystemMessage(
-                    content=(
-                        "你是法律文书助手。根据用户输入，识别要写的文书类型，"
-                        "只能从以下选项中选：起诉状/答辩状/反诉状/上诉状/代理词/"
-                        "再审申请书/申请书/异议书/授权委托书/身份证明书。"
-                        "只返回类型名，不要其他内容。若无法判断返回 unknown。"
-                    )
-                ),
-                HumanMessage(content=state["user_input"]),
-            ])
+            async with timed("LLM意图识别"):
+                resp = await llm.ainvoke([
+                    SystemMessage(
+                        content=(
+                            "你是法律文书助手。根据用户输入，识别要写的文书类型，"
+                            "只能从以下选项中选：起诉状/答辩状/反诉状/上诉状/代理词/"
+                            "再审申请书/申请书/异议书/授权委托书/身份证明书。"
+                            "只返回类型名，不要其他内容。若无法判断返回 unknown。"
+                        )
+                    ),
+                    HumanMessage(content=state["user_input"]),
+                ])
             doc_type = resp.content.strip()
             logger.info(
                 "[intent_node] LLM 返回 doc_type=%r, usage_metadata=%s",
@@ -261,7 +274,8 @@ def build_draft_graph(user: User, db: Session):
                 "键为字段名，值为提取到的内容（提取不到的不要写）。只返回 JSON。"
             )
             logger.debug("[collect_node] 调用 LLM 提取字段")
-            resp = await llm.ainvoke([HumanMessage(content=prompt)])
+            async with timed("LLM字段提取"):
+                resp = await llm.ainvoke([HumanMessage(content=prompt)])
             logger.info(
                 "[collect_node] LLM 返回: content_preview=%r, usage_metadata=%s",
                 (resp.content or "")[:80], resp.usage_metadata,
@@ -306,10 +320,11 @@ def build_draft_graph(user: User, db: Session):
             )
             try:
                 logger.debug("[draft_node] 调用 LLM 按反馈微调")
-                resp = await llm.ainvoke([
-                    SystemMessage(content="根据用户反馈修改文书草稿，直接返回修改后的完整文书。"),
-                    HumanMessage(content=f"原草稿：\n{state['draft']}\n\n用户反馈：{feedback}"),
-                ])
+                async with timed("LLM微调草稿"):
+                    resp = await llm.ainvoke([
+                        SystemMessage(content="根据用户反馈修改文书草稿，直接返回修改后的完整文书。"),
+                        HumanMessage(content=f"原草稿：\n{state['draft']}\n\n用户反馈：{feedback}"),
+                    ])
                 logger.info(
                     "[draft_node] 微调完成: 新草稿长度=%d, usage_metadata=%s",
                     len(resp.content or ""), resp.usage_metadata,
@@ -338,18 +353,19 @@ def build_draft_graph(user: User, db: Session):
         logger.debug("[draft_node] 模板已填充: rendered_len=%d", len(rendered))
         try:
             logger.debug("[draft_node] 调用 LLM 生成文书")
-            resp = await llm.ainvoke([
-                SystemMessage(
-                    content=(
-                        "你是资深律师。请仅对已提供的文书内容进行格式规范、"
-                        "语言润色与结构整理，使表达专业、通顺。"
-                        "严禁编造、补充或猜测任何缺失的事实、理由、当事人、日期等案件信息；"
-                        "文中标注“（此处待补充）”的内容保持原样，不得自行填写。"
-                        "直接返回完整文书内容，不要解释。"
-                    )
-                ),
-                HumanMessage(content=f"当前文书：\n{rendered}"),
-            ])
+            async with timed("LLM生成草稿"):
+                resp = await llm.ainvoke([
+                    SystemMessage(
+                        content=(
+                            "你是资深律师。请仅对已提供的文书内容进行格式规范、"
+                            "语言润色与结构整理，使表达专业、通顺。"
+                            "严禁编造、补充或猜测任何缺失的事实、理由、当事人、日期等案件信息；"
+                            "文中标注“（此处待补充）”的内容保持原样，不得自行填写。"
+                            "直接返回完整文书内容，不要解释。"
+                        )
+                    ),
+                    HumanMessage(content=f"当前文书：\n{rendered}"),
+                ])
             logger.info(
                 "[draft_node] 生成完成: 草稿长度=%d, usage_metadata=%s",
                 len(resp.content or ""), resp.usage_metadata,
@@ -396,8 +412,14 @@ def build_draft_graph(user: User, db: Session):
         doc_type = state.get("doc_type", "文书")
         draft = state.get("draft", "")
         case_id = state.get("case_id")
-        file_url = generate_docx(doc_type, draft, case_id)
-        pdf_url = generate_pdf(doc_type, draft, case_id)
+        if _report:
+            with _report.stage("生成docx"):
+                file_url = generate_docx(doc_type, draft, case_id)
+            with _report.stage("生成pdf"):
+                pdf_url = generate_pdf(doc_type, draft, case_id)
+        else:
+            file_url = generate_docx(doc_type, draft, case_id)
+            pdf_url = generate_pdf(doc_type, draft, case_id)
         logger.info("[finalize_node] 文件已生成: docx=%s, pdf=%s", file_url, pdf_url)
         return {"file_url": file_url, "pdf_url": pdf_url}
 

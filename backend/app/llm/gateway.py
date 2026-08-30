@@ -171,6 +171,11 @@ class LLMGateway:
             "[get_chat_model] 解析完成: source=%s, provider=%s, model=%s, base_url=%s, key_masked=%s",
             cfg.source, cfg.provider, target_model, cfg.base_url, mask_api_key(cfg.api_key),
         )
+        # DeepSeek 推理模型默认深度思考会拖慢首 token（实测 3.1s → 1.2s）；
+        # 其他供应商不注入 extra_body，避免拒绝未知字段
+        extra: dict = {}
+        if cfg.provider == "deepseek" and settings.LLM_THINKING_DISABLED:
+            extra["extra_body"] = {"thinking": {"type": "disabled"}}
         return ChatOpenAI(
             model=target_model,
             api_key=cfg.api_key,
@@ -179,6 +184,7 @@ class LLMGateway:
             streaming=streaming,
             request_timeout=settings.LLM_TIMEOUT,
             max_retries=settings.LLM_MAX_RETRIES,
+            **extra,
         )
 
     def enforce_quota(self, user: User, cfg: ResolvedConfig, db: Session) -> None:

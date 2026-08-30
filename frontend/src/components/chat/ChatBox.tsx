@@ -17,6 +17,7 @@ import {
   RobotOutlined,
   LinkOutlined,
   FileTextOutlined,
+  BookOutlined,
 } from '@ant-design/icons';
 import { useAuthStore } from '../../stores/authStore';
 import { useLlmStore } from '../../stores/llmStore';
@@ -59,6 +60,7 @@ export default function ChatBox() {
   const [sending, setSending] = useState(false);
   const [fileList, setFileList] = useState<UploadFile[]>([]);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [useRag, setUseRag] = useState(true);
   const [selectedTemplate, setSelectedTemplate] = useState<DocTemplate | null>(null);
   const [draftResult, setDraftResult] = useState<DraftResult | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
@@ -211,7 +213,7 @@ export default function ChatBox() {
         attachments: sentAttachments,
         case_id: currentCase?.id,
         case_name: currentCase?.name,
-        use_rag: true,
+        use_rag: useRag,
       },
       {
         onMeta: (meta) => {
@@ -498,6 +500,14 @@ export default function ChatBox() {
         }}
       >
         <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+          <Tooltip title={useRag ? '知识库检索已开启：回答将引用参考资料' : '知识库检索已关闭：直接让模型回答'}>
+            <Button
+              icon={<BookOutlined />}
+              type={useRag ? 'primary' : 'default'}
+              onClick={() => setUseRag((v) => !v)}
+              style={{ flexShrink: 0 }}
+            />
+          </Tooltip>
           <Tooltip title={llmReady ? '添加附件' : '请先配置模型 API'}>
             <Upload
               multiple

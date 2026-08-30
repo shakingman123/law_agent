@@ -15,12 +15,18 @@ class Settings(BaseSettings):
     # 默认 120s 与前端 chat.ts 的 LLM_TIMEOUT 对齐，避免文书撰写（draft_node 润色长文本）超时
     LLM_TIMEOUT: float = 120.0
     LLM_MAX_RETRIES: int = 2
+    # 关闭 DeepSeek 推理模型的深度思考（thinking），首 token 延迟 3.1s → 1.2s
+    # 仅对 deepseek 供应商生效；设为 false 可恢复思考以提升复杂任务质量
+    LLM_THINKING_DISABLED: bool = True
     # CORS 允许来源（逗号分隔）
     CORS_ORIGINS: str = "http://localhost:5173"
     # 文件上传目录（开发环境本地磁盘）
     UPLOAD_DIR: str = "uploads"
     # Chroma 向量库持久化目录
     CHROMA_DIR: str = "chroma_db"
+    # 检索相关性阈值：余弦距离超过该值的命中视为不相关并丢弃
+    # （0.4 很严格 / 0.55 均衡 / 0.7 宽松；设为 1.0 等于不过滤）
+    RAG_MAX_DISTANCE: float = 0.55
     # Qdrant 向量库（法律检索多源 RAG）
     QDRANT_URL: str = "http://localhost:6333"
     QDRANT_API_KEY: str = ""
