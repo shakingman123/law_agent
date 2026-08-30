@@ -83,8 +83,6 @@ export default function ChatBox() {
   const hasCompanyApi = !!companyConfig?.isActive;
   const hasPersonalApi = !!personalConfig?.isActive;
   const llmReady = hasCompanyApi || hasPersonalApi;
-  const currentSource = user?.llmSource ?? 'company';
-  const currentReady = currentSource === 'company' ? hasCompanyApi : hasPersonalApi;
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -111,7 +109,8 @@ export default function ChatBox() {
   };
 
   const handleSend = async () => {
-    if (!llmReady || !currentReady) {
+    // 只要任一 API（公司/个人）已配置即可发送；所选源未配置时后端会自动降级到另一源
+    if (!llmReady) {
       navigate('/settings');
       return;
     }
@@ -245,11 +244,9 @@ export default function ChatBox() {
 
   const placeholder = !llmReady
     ? '暂未添加模型api，请在设置中添加～'
-    : !currentReady
-      ? `当前使用${currentSource === 'company' ? '公司' : '个人'} API，但尚未配置，请在设置中添加～`
-      : selectedTemplate
-        ? `已选「${selectedTemplate.name}」模板，请描述文书要求（如：诉讼请求、事实理由）`
-        : '输入法律问题，或在下方选择模板生成文书（如：帮我写一份上诉状）';
+    : selectedTemplate
+      ? `已选「${selectedTemplate.name}」模板，请描述文书要求（如：诉讼请求、事实理由）`
+      : '输入法律问题，或在下方选择模板生成文书（如：帮我写一份上诉状）';
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
