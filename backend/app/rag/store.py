@@ -24,45 +24,36 @@ _client: Optional[chromadb.PersistentClient] = None
 DEFAULT_COLLECTION = "knowledge_base"
 
 # 显式 embedding 函数：all-MiniLM-L6-v2（384 维），与 qdrant_store 共享向量空间。
-# 多层回退避免服务器上 ChromaDB ONNX Rust 绑定版本不匹配（'RustBindingsAPI' object has no attribute 'bindings'）。
+# 服务器离线环境下 ONNX 模型随 chromadb 包预装，只需目录权限即可运行。
+# 关键：import 阶段绝不能触发 HuggingFace 联网下载——否则 systemd 启动超时杀进程 → nginx 502。
 def _init_embedding_fn():
-    """ONNXMiniLM_L6_V2 → SentenceTransformerEmbeddingFunction 多层回退。"""
+    """多层回退，但只做构造不做 probe（probe 会触发模型写入/联网）。"""
     logger = logging.getLogger("app.rag")
-    # 1) 优先用 ONNX MiniLM（最快，本地 ONNX 推理，不依赖 HuggingFace 在线下载）
+    # 1) 优先 ONNX MiniLM：模型随 chromadb 预装在 site-packages/chromadb/utils/embedding_functions/models/
+    #    不需要联网，只需要 ~/.cache/chroma/onnx_models 目录写权限
     try:
         from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
 
         fn = ONNXMiniLM_L6_V2()
-        # 预跑一次验证 Rust 绑定可用（某些 chromadb 版本组合下延迟初始化才炸）
-        fn(["_init_probe"])
-        logger.info("[rag] embedding: ONNXMiniLM_L6_V2 (ONNX)")
+        # 不跑 probe！probe 会触发首次 embed 写缓存 → 权限被拒 → 掉到 SentenceTransformer → 联网超时
+        # 延迟到第一次真正的 col.add() / col.query() 时再决定是否需要 per-call 回退
+        logger.info("[rag] embedding: ONNXMiniLM_L6_V2 (ONNX, 延迟验证)")
         return fn
     except Exception as e:  # noqa: BLE001
-        logger.warning("[rag] ONNXMiniLM_L6_V2 初始化失败: %s，尝试 SentenceTransformer", e)
+        logger.warning("[rag] ONNXMiniLM_L6_V2 构造失败: %s", e)
 
-    # 2) 回退到 SentenceTransformer（PyTorch 实现，更通用；首次运行会缓存模型到本地）
+    # 2) SentenceTransformer：服务器无外网时会在 probe 阶段卡 HuggingFace 超时
+    #    只构造不 probe，让延迟失败由 per-call 回退处理
     try:
         from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
         fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-        fn(["_init_probe"])
-        logger.info("[rag] embedding: SentenceTransformer (PyTorch)")
+        logger.info("[rag] embedding: SentenceTransformer (PyTorch, 延迟验证)")
         return fn
     except Exception as e:  # noqa: BLE001
-        logger.warning("[rag] SentenceTransformer 也失败: %s，尝试 OpenCLIP", e)
+        logger.warning("[rag] SentenceTransformer 构造失败: %s", e)
 
-    # 3) 最后尝试 OpenCLIP
-    try:
-        from chromadb.utils.embedding_functions import OpenCLIPEmbeddingFunction
-
-        fn = OpenCLIPEmbeddingFunction()
-        fn(["_init_probe"])
-        logger.info("[rag] embedding: OpenCLIP")
-        return fn
-    except Exception as e:  # noqa: BLE001
-        raise RuntimeError(
-            f"所有 embedding 函数均初始化失败，请检查 chromadb 依赖: {e}"
-        ) from e
+    raise RuntimeError("所有 embedding 函数构造失败，请检查 chromadb/onnxruntime 依赖")
 
 
 EMBEDDING_FN = _init_embedding_fn()
