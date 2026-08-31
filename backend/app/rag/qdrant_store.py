@@ -40,18 +40,24 @@ ALL_COLLECTIONS = list(COLLECTION_LABELS.keys())
 
 @lru_cache(maxsize=1)
 def _get_embedding_fn():
-    """复用 ChromaDB 默认 embedding 函数（all-MiniLM-L6-v2，384 维）。"""
-    from chromadb.utils import embedding_functions
+    """获取 embedding 函数（与 store.py 保持同一套多层回退策略，保证向量空间一致）。"""
+    from app.rag.store import _init_embedding_fn
 
-    fn = embedding_functions.DefaultEmbeddingFunction()
-    logger.info("[qdrant] embedding 函数已加载: all-MiniLM-L6-v2 (384d)")
-    return fn
+    return _init_embedding_fn()
 
 
 def _embed(text: str) -> list[float]:
-    """将文本转为向量。"""
+    """将文本转为向量；ONNX 延迟失败时自动重新初始化 embedding 函数并重试。"""
     fn = _get_embedding_fn()
-    return fn([text])[0]
+    try:
+        return fn([text])[0]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[qdrant] embed 调用异常，重置 embedding 函数重试: %s", e)
+        _get_embedding_fn.cache_clear()  # 清缓存后下次调用会自然重新初始化
+        from app.rag.store import _init_embedding_fn
+
+        fn = _init_embedding_fn()
+        return fn([text])[0]
 
 
 # Qdrant 客户端单例（进程级缓存：None 表示不可用）

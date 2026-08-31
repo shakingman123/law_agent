@@ -21,6 +21,8 @@ langgraph-checkpoint-postgres
 chromadb
 python-docx
 pdfplumber
+# Embedding 多层回退依赖（ONNXMiniLM_L6_V2 → SentenceTransformer）
+sentence-transformers
 # 网页入库解析（HTML 上传 / URL 抓取）
 beautifulsoup4
 lxml

@@ -23,11 +23,49 @@ _client: Optional[chromadb.PersistentClient] = None
 # 默认知识库集合名
 DEFAULT_COLLECTION = "knowledge_base"
 
-# 显式 embedding 函数：chroma 自带 ONNX MiniLM（本地缓存，不依赖 HuggingFace 在线下载）。
-# 必须显式指定——"default" EF 在不同进程可能解析到不同模型，导致查询向量与入库向量不一致。
-from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
+# 显式 embedding 函数：all-MiniLM-L6-v2（384 维），与 qdrant_store 共享向量空间。
+# 多层回退避免服务器上 ChromaDB ONNX Rust 绑定版本不匹配（'RustBindingsAPI' object has no attribute 'bindings'）。
+def _init_embedding_fn():
+    """ONNXMiniLM_L6_V2 → SentenceTransformerEmbeddingFunction 多层回退。"""
+    logger = logging.getLogger("app.rag")
+    # 1) 优先用 ONNX MiniLM（最快，本地 ONNX 推理，不依赖 HuggingFace 在线下载）
+    try:
+        from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
 
-EMBEDDING_FN = ONNXMiniLM_L6_V2()
+        fn = ONNXMiniLM_L6_V2()
+        # 预跑一次验证 Rust 绑定可用（某些 chromadb 版本组合下延迟初始化才炸）
+        fn(["_init_probe"])
+        logger.info("[rag] embedding: ONNXMiniLM_L6_V2 (ONNX)")
+        return fn
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[rag] ONNXMiniLM_L6_V2 初始化失败: %s，尝试 SentenceTransformer", e)
+
+    # 2) 回退到 SentenceTransformer（PyTorch 实现，更通用；首次运行会缓存模型到本地）
+    try:
+        from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+
+        fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+        fn(["_init_probe"])
+        logger.info("[rag] embedding: SentenceTransformer (PyTorch)")
+        return fn
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[rag] SentenceTransformer 也失败: %s，尝试 OpenCLIP", e)
+
+    # 3) 最后尝试 OpenCLIP
+    try:
+        from chromadb.utils.embedding_functions import OpenCLIPEmbeddingFunction
+
+        fn = OpenCLIPEmbeddingFunction()
+        fn(["_init_probe"])
+        logger.info("[rag] embedding: OpenCLIP")
+        return fn
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            f"所有 embedding 函数均初始化失败，请检查 chromadb 依赖: {e}"
+        ) from e
+
+
+EMBEDDING_FN = _init_embedding_fn()
 
 # 文本切块器：500 字符，重叠 50
 _splitter = RecursiveCharacterTextSplitter(
@@ -72,7 +110,24 @@ def ingest_text(
     col = _get_collection(collection)
     ids = [str(uuid.uuid4()) for _ in chunks]
     metadatas = [{**(metadata or {}), "source": source, "chunk_index": i} for i in range(len(chunks))]
-    col.add(documents=chunks, metadatas=metadatas, ids=ids)
+    try:
+        col.add(documents=chunks, metadatas=metadatas, ids=ids)
+    except Exception as e:  # noqa: BLE001
+        # ONNX init probe 可能通过但实际 embed 时才炸（Rust 绑定延迟失败）
+        logger.warning("[rag] Chroma 入库异常（可能是延迟失败的 Rust 绑定），尝试重新初始化 embedding: %s", e)
+        # 重新加载 _init_embedding_fn 会跳过 ONNX 直接回退到 SentenceTransformer
+        global EMBEDDING_FN
+        try:
+            EMBEDDING_FN = _init_embedding_fn()
+        except Exception as e2:  # noqa: BLE001
+            raise RuntimeError(f"embedding 重新初始化仍失败: {e2}") from e
+        # 重建 collection（因为旧 collection 缓存了旧的 embedding_function 引用）
+        col = _get_client().get_or_create_collection(
+            name=collection,
+            embedding_function=EMBEDDING_FN,
+            configuration={"hnsw": {"space": "cosine"}},
+        )
+        col.add(documents=chunks, metadatas=metadatas, ids=ids)
     logger.info("[rag] 入库完成: collection=%s, chunks=%d, source=%s", collection, len(chunks), source)
     return len(chunks)
 

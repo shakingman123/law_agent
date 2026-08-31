@@ -145,13 +145,14 @@ def ingest_url(payload: IngestUrlRequest, user=Depends(get_admin_user)):
     要求目标网页可公开访问（无需登录），静态 HTML 中的正文可完整提取；
     JS 动态渲染的内容无法抓取。
     """
+    import requests
+
     collection = _resolve_collection(payload.collection_key)
     url = payload.url.strip()
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=422, detail="URL 必须以 http:// 或 https:// 开头")
 
-    import requests
-
+    # 1) 抓取
     try:
         resp = requests.get(
             url,
@@ -159,24 +160,39 @@ def ingest_url(payload: IngestUrlRequest, user=Depends(get_admin_user)):
             headers={"User-Agent": "Mozilla/5.0 (compatible; LawAgentKB/1.0; +https://lawagent.local)"},
         )
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"网页抓取失败: {e}")
+        raise HTTPException(status_code=502, detail=f"网页抓取失败: {e}") from e
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail=f"网页返回状态码 {resp.status_code}，无法抓取")
     content_type = resp.headers.get("content-type", "")
     if "html" not in content_type and "xml" not in content_type and "text" not in content_type:
         raise HTTPException(status_code=422, detail=f"不支持的内容类型: {content_type}")
 
-    text, page_title = html_to_text(resp.content)
+    # 2) 提取正文
+    try:
+        text, page_title = html_to_text(resp.content)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"正文提取失败: {e}") from e
     if not text or not text.strip():
         raise HTTPException(status_code=422, detail="网页无可提取正文（可能为 JS 动态渲染页面）")
 
+    # 3) 切块 + 向量化入库
     doc_title = payload.title.strip() or page_title or url
-    chunks = qdrant_store.ingest_document(
-        text,
-        title=doc_title,
-        collection=collection,
-        metadata={"source_url": url, "file_name": page_title or url, "uploaded_by": str(user.id)},
-    )
+    try:
+        chunks = qdrant_store.ingest_document(
+            text,
+            title=doc_title,
+            collection=collection,
+            metadata={"source_url": url, "file_name": page_title or url, "uploaded_by": str(user.id)},
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=f"向量化入库失败（Qdrant/ChromaDB 均不可用或 embedding 函数异常）: {e}",
+        ) from e
     if chunks == 0:
-        raise HTTPException(status_code=500, detail="入库失败，请检查 Qdrant/Chroma 服务")
+        raise HTTPException(
+            status_code=500,
+            detail="向量化入库失败：所有切块均未成功写入，可能是 ChromaDB ONNX Rust 绑定版本不匹配。"
+            " 请执行 pip install --upgrade chromadb chromadb-onnx-minilm-l6-v2，或联系管理员查看后端日志。",
+        )
     return {"ingested_chunks": chunks, "title": doc_title, "url": url, "collection": collection}
