@@ -1,13 +1,16 @@
 """RAG 知识库管理接口（仅管理员）。
 
-面向前端「知识库」页面，管理法律检索三个语料库：
-    law    → 法条库（law_articles）
-    case   → 判例库（case_precedents）
-    wechat → 观点库（wechat_articles，公众号观点）
+面向前端「知识库」页面，管理统一知识库 knowledge_base 的三个分类：
+    law    → 法条库
+    case   → 判例库
+    wechat → 观点库（公众号观点）
+
+所有分类共用 knowledge_base 集合，用 metadata.category 区分。
 
 - POST   /api/rag/admin/ingest-file                        上传文件（切块 + 向量化入库）
+- POST   /api/rag/admin/ingest-url                         抓取网页正文入库
 - GET    /api/rag/admin/documents?collection_key=law       分页列出已入库条目
-- GET    /api/rag/admin/search?q=&collection_key=law       语义搜索（不传 collection_key 则多库合并）
+- GET    /api/rag/admin/search?q=&collection_key=law       语义搜索（不传则三路加权合并）
 - DELETE /api/rag/admin/documents/{collection_key}/{point_id}  删除单条向量
 """
 import os
@@ -16,31 +19,25 @@ import tempfile
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from app.core.config import settings
 from app.core.deps import get_admin_user
 from app.rag import qdrant_store
 from app.rag.store import _extract_text, html_to_text
 
 router = APIRouter(prefix="/api/rag/admin", tags=["rag-admin"])
 
-# 前端集合简称 → Qdrant 集合名
-COLLECTION_MAP = {
-    "law": settings.QDRANT_COLLECTION_LAW,
-    "case": settings.QDRANT_COLLECTION_CASE,
-    "wechat": settings.QDRANT_COLLECTION_WECHAT,
-}
-
+# 前端分类简称（同时也是 metadata.category 的值）
+VALID_CATEGORIES = {"law", "case", "wechat"}
 COLLECTION_LABELS = {"law": "法条库", "case": "判例库", "wechat": "观点库"}
 
 ALLOWED_EXTS = (".txt", ".md", ".markdown", ".pdf", ".docx", ".html", ".htm")
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
 
 
-def _resolve_collection(collection_key: str) -> str:
-    name = COLLECTION_MAP.get(collection_key)
-    if not name:
+def _resolve_category(collection_key: str) -> str:
+    """校验分类 key 并返回 category 值（直接用 collection_key 做 category）。"""
+    if collection_key not in VALID_CATEGORIES:
         raise HTTPException(status_code=422, detail=f"无效的知识库类型: {collection_key}，应为 law/case/wechat")
-    return name
+    return collection_key
 
 
 @router.post("/ingest-file")
@@ -50,12 +47,12 @@ def ingest_file(
     title: str = Form(""),
     user=Depends(get_admin_user),
 ):
-    """上传文件到指定知识库：提取文本 → 切块 → 向量化入库（Qdrant 优先，失败回退 Chroma）。"""
-    collection = _resolve_collection(collection_key)
+    """上传文件到指定分类：提取文本 → 切块 → 向量化入库。"""
+    category = _resolve_category(collection_key)
     filename = file.filename or "untitled"
     ext = os.path.splitext(filename)[1].lower()
     if ext not in ALLOWED_EXTS:
-        raise HTTPException(status_code=422, detail="仅支持 .txt/.md/.pdf/.docx 格式")
+        raise HTTPException(status_code=422, detail="仅支持 .txt/.md/.pdf/.docx/.html 格式")
 
     # 落临时文件以便按扩展名提取
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
@@ -76,12 +73,18 @@ def ingest_file(
     chunks = qdrant_store.ingest_document(
         text,
         title=doc_title,
-        collection=collection,
+        category=category,
         metadata={"file_name": filename, "uploaded_by": str(user.id)},
     )
     if chunks == 0:
-        raise HTTPException(status_code=500, detail="入库失败，请检查 Qdrant/Chroma 服务")
-    return {"ingested_chunks": chunks, "file_name": filename, "title": doc_title, "collection": collection}
+        raise HTTPException(status_code=500, detail="入库失败，请检查向量服务")
+    return {
+        "ingested_chunks": chunks,
+        "file_name": filename,
+        "title": doc_title,
+        "category": category,
+        "label": COLLECTION_LABELS[category],
+    }
 
 
 @router.get("/documents")
@@ -91,11 +94,11 @@ def list_documents(
     offset: str = "",
     user=Depends(get_admin_user),
 ):
-    """分页列出某知识库已入库条目（next_offset 为空表示到底）。"""
-    collection = _resolve_collection(collection_key)
+    """分页列出某分类已入库条目（next_offset 为空表示到底）。"""
+    category = _resolve_category(collection_key)
     page_size = max(1, min(page_size, 100))
-    result = qdrant_store.scroll_points(collection, limit=page_size, offset=offset or None)
-    return {**result, "collection": collection, "label": COLLECTION_LABELS[collection_key]}
+    result = qdrant_store.scroll_points(category=category, limit=page_size, offset=offset or None)
+    return {**result, "category": category, "label": COLLECTION_LABELS[category]}
 
 
 @router.get("/search")
@@ -105,17 +108,14 @@ def search(
     top_k: int = 10,
     user=Depends(get_admin_user),
 ):
-    """语义搜索已入库内容；不传 collection_key 时在三个库中并行检索并按相关度合并。"""
+    """语义搜索已入库内容；不传 collection_key 时三路加权并行检索。"""
     if not q or not q.strip():
         raise HTTPException(status_code=422, detail="搜索关键词不能为空")
     top_k = max(1, min(top_k, 30))
     if collection_key:
-        collection = _resolve_collection(collection_key)
+        category = _resolve_category(collection_key)
         hits = qdrant_store.search(
-            q,
-            collection=collection,
-            top_k=top_k,
-            source_label=COLLECTION_LABELS[collection_key],
+            q, category=category, top_k=top_k, source_label=COLLECTION_LABELS[collection_key],
         )
     else:
         hits = qdrant_store.search_multi(q, top_k=top_k)
@@ -125,8 +125,8 @@ def search(
 @router.delete("/documents/{collection_key}/{point_id}")
 def delete_document(collection_key: str, point_id: str, user=Depends(get_admin_user)):
     """删除单条向量。"""
-    collection = _resolve_collection(collection_key)
-    ok = qdrant_store.delete_point(collection, point_id)
+    _resolve_category(collection_key)  # 校验但不用于删除（point_id 全局唯一）
+    ok = qdrant_store.delete_point(point_id)
     if not ok:
         raise HTTPException(status_code=500, detail="删除失败")
     return {"deleted": True, "id": point_id}
@@ -147,7 +147,7 @@ def ingest_url(payload: IngestUrlRequest, user=Depends(get_admin_user)):
     """
     import requests
 
-    collection = _resolve_collection(payload.collection_key)
+    category = _resolve_category(payload.collection_key)
     url = payload.url.strip()
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=422, detail="URL 必须以 http:// 或 https:// 开头")
@@ -181,18 +181,20 @@ def ingest_url(payload: IngestUrlRequest, user=Depends(get_admin_user)):
         chunks = qdrant_store.ingest_document(
             text,
             title=doc_title,
-            collection=collection,
+            category=category,
             metadata={"source_url": url, "file_name": page_title or url, "uploaded_by": str(user.id)},
         )
     except Exception as e:  # noqa: BLE001
         raise HTTPException(
             status_code=500,
-            detail=f"向量化入库失败（Qdrant/ChromaDB 均不可用或 embedding 函数异常）: {e}",
+            detail=f"向量化入库失败（向量服务不可用或 embedding 异常）: {e}",
         ) from e
     if chunks == 0:
-        raise HTTPException(
-            status_code=500,
-            detail="向量化入库失败：所有切块均未成功写入，可能是 ChromaDB ONNX Rust 绑定版本不匹配。"
-            " 请执行 pip install --upgrade chromadb chromadb-onnx-minilm-l6-v2，或联系管理员查看后端日志。",
-        )
-    return {"ingested_chunks": chunks, "title": doc_title, "url": url, "collection": collection}
+        raise HTTPException(status_code=500, detail="向量化入库失败：所有切块均未成功写入。")
+    return {
+        "ingested_chunks": chunks,
+        "title": doc_title,
+        "url": url,
+        "category": category,
+        "label": COLLECTION_LABELS[category],
+    }

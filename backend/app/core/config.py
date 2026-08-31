@@ -26,18 +26,32 @@ class Settings(BaseSettings):
     CHROMA_DIR: str = "chroma_db"
     # 检索相关性阈值：余弦距离超过该值的命中视为不相关并丢弃
     # （0.4 很严格 / 0.55 均衡 / 0.7 宽松；设为 1.0 等于不过滤）
-    RAG_MAX_DISTANCE: float = 0.55
+    # RAG 检索相关性阈值（向量粗召回 + 关键词精过滤）
+    # 法律领域用英文优先的 embedding 模型（all-MiniLM-L6-v2），中文语义区分度不够，
+    # 需要两级阈值：放宽阈值做粗召回，严格阈值以内信任向量，中间区间用关键词重叠率过滤
+    RAG_MAX_DISTANCE: float = 0.60       # 放宽阈值：超过则直接丢弃（完全不相关）
+    RAG_STRICT_DISTANCE: float = 0.45    # 严格阈值：以内的结果直接信任向量相关性
+    RAG_MIN_KEYWORD_OVERLAP: float = 0.4  # 中间区间的关键词重叠率门槛（query 的 n-gram 至少 40% 出现在 content 里）
     # Qdrant 向量库（法律检索多源 RAG）
     QDRANT_URL: str = "http://localhost:6333"
     QDRANT_API_KEY: str = ""
     # Qdrant 客户端超时（秒）
     QDRANT_TIMEOUT: float = 5.0
-    # Qdrant 集合名
-    QDRANT_COLLECTION_LAW: str = "law_articles"          # 法条库
-    QDRANT_COLLECTION_CASE: str = "case_precedents"      # 判例库（公司脱敏案例）
-    QDRANT_COLLECTION_WECHAT: str = "wechat_articles"   # 公众号观点
+    # Qdrant 集合名（统一使用 knowledge_base 单一集合，分类用 metadata.category 区分）
+    # 保留旧变量名做兼容，值全部指向 knowledge_base
+    QDRANT_COLLECTION_LAW: str = "knowledge_base"
+    QDRANT_COLLECTION_CASE: str = "knowledge_base"
+    QDRANT_COLLECTION_WECHAT: str = "knowledge_base"
     # RAG 检索默认返回条数
     RAG_TOP_K: int = 5
+    # 检索时每个分类单独取多少条再合并（每路 top_k，合并后再截一次 RAG_TOP_K）
+    RAG_PER_CATEGORY_K: int = 5
+    # 知识库分类检索权重（法条=权威依据，判例=参考，公众号=一家之言）
+    RAG_CATEGORY_WEIGHTS: dict = {
+        "law": 1.0,
+        "case": 0.8,
+        "wechat": 0.5,
+    }
     # 对话上下文：拼进 LLM 的最近消息轮数（1 轮 = 1 条 user + 1 条 agent）
     CHAT_HISTORY_ROUNDS: int = 5
     # ClamAV 病毒扫描（留空则使用 TCP；填写路径则用 Unix socket）

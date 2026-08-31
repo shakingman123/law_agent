@@ -187,31 +187,169 @@ def _extract_text(file_path: str) -> str:
         return ""
 
 
+def _char_ngrams(text: str, n: int = 2) -> set[str]:
+    """生成中文 n-gram 字符集（2字滑动窗口），用于关键词重叠度计算。"""
+    text = (text or "").strip()
+    if not text:
+        return set()
+    if len(text) <= n:
+        return {text}
+    return {text[i : i + n] for i in range(len(text) - n + 1)}
+
+
+def _keyword_overlap(query: str, content: str) -> float:
+    """计算 query 和 content 的 2-gram 重叠率（以 query 的 n-gram 为分母）。
+
+    中文语义单元通常是 2 字以上，2-gram 比单字更有判别力。
+    返回 0~1 的比例，>=0.5 表示 query 的一半以上 2-gram 出现在 content 里。
+    """
+    q_ngrams = _char_ngrams(query, 2)
+    if not q_ngrams:
+        return 0.0
+    c_ngrams = _char_ngrams(content, 2)
+    overlap = q_ngrams & c_ngrams
+    return len(overlap) / len(q_ngrams)
+
+
+def _single_category_query(
+    col, query: str, category: str, k: int, report_stage: str = ""
+) -> list[dict]:
+    """单分类检索：向量粗召回 + 关键词精过滤。
+
+    流程：
+      1. 向量检索（用放宽的 RAG_MAX_DISTANCE 做粗召回）
+      2. 对距离 > 严格阈值 RAG_STRICT_DISTANCE 的结果，再用关键词重叠率过滤
+      3. 关键词重叠率 < RAG_MIN_KEYWORD_OVERLAP 的视为不相关，丢弃
+
+    这样兼顾短 query（向量距离高但关键词完全匹配）和长 query（向量距离低）。
+    """
+    where_filter = {"category": category} if category else None
+    result = col.query(
+        query_texts=[query],
+        n_results=k,
+        where=where_filter,
+        include=["documents", "metadatas", "distances"],
+    )
+    docs = result.get("documents", [[]])[0]
+    metas = result.get("metadatas", [[]])[0]
+    dists = (result.get("distances") or [[]])[0]
+    out = []
+    for doc, meta, dist in zip(docs, metas, dists):
+        # 1. 距离 > 放宽阈值 → 直接丢弃（完全不相关）
+        if dist > settings.RAG_MAX_DISTANCE:
+            continue
+        # 2. 距离 <= 严格阈值 → 信任向量结果，直接通过
+        if dist <= settings.RAG_STRICT_DISTANCE:
+            out.append({"content": doc, "distance": dist, "category": category, **(meta or {})})
+            continue
+        # 3. 距离在 (严格阈值, 放宽阈值] 之间 → 关键词重叠率二次过滤
+        overlap = _keyword_overlap(query, doc)
+        if overlap >= settings.RAG_MIN_KEYWORD_OVERLAP:
+            out.append({"content": doc, "distance": dist, "category": category, **(meta or {})})
+        else:
+            logger.debug(
+                "[rag] 关键词过滤丢弃: dist=%.4f overlap=%.2f query=%r content=%s",
+                dist, overlap, query[:30], (doc or "")[:50],
+            )
+    return out
+
+
+def _merge_weighted(
+    results_by_category: dict[str, list[dict]],
+    weights: dict,
+    final_k: int,
+) -> list[dict]:
+    """三路并行检索结果 → 乘权重 → 合并排序 → 取 top_k。
+
+    Chroma 返回余弦距离（0=完全相同，2=完全相反），转 score = 1 - distance。
+    """
+    merged = []
+    for cat, hits in results_by_category.items():
+        w = weights.get(cat, 0.5)
+        for h in hits:
+            raw_score = 1 - h.get("distance", 1)  # 距离越小越相关
+            h["score"] = raw_score * w
+            h["category"] = cat
+            merged.append(h)
+    merged.sort(key=lambda r: r["score"], reverse=True)
+    return merged[:final_k]
+
+
 def retrieve(
     query: str,
     top_k: Optional[int] = None,
     collection: str = DEFAULT_COLLECTION,
+    category: str = "",
+    weighted: bool = True,
     _report=None,
 ) -> list[dict]:
     """检索与 query 最相关的文档片段，返回 [{content, source, ...}]。
 
-    _report: 可选 StageReport，细分计时（chroma查询含 embed + 检索）。
+    Args:
+        query: 检索文本。
+        top_k: 最终返回条数（默认 settings.RAG_TOP_K）。
+        collection: Chroma 集合名（默认 knowledge_base）。
+        category: 只检索某分类（"law"/"case"/"wechat"）。空字符串=不过滤。
+        weighted: 是否启用加权并行三路检索（True=三分类并行+权重合并；False=单集合不过滤）。
+            - chat.py 对话框用 weighted=True（全局加权检索）。
+            - 知识库管理页面指定分类时用 weighted=False + category="law"（单路无加权）。
+        _report: 可选 StageReport，细分计时。
     """
     if not query or not query.strip():
         return []
     col = _get_collection(collection)
     k = top_k or settings.RAG_TOP_K
+
+    # 情况 1：指定了 category → 单分类检索
+    if category:
+        stage_name = f"chroma查询({category})"
+        if _report:
+            with _report.stage(stage_name):
+                hits = _single_category_query(col, query, category, k)
+        else:
+            hits = _single_category_query(col, query, category, k)
+        logger.info(
+            "[rag] 单分类检索: category=%s, query=%r, hits=%d, 阈值=%.2f",
+            category, query[:40], len(hits), settings.RAG_MAX_DISTANCE,
+        )
+        return hits
+
+    # 情况 2：weighted=True → 三分类并行 + 加权合并
+    if weighted:
+        from concurrent.futures import ThreadPoolExecutor
+
+        cats = list(settings.RAG_CATEGORY_WEIGHTS.keys())
+        per_k = settings.RAG_PER_CATEGORY_K
+        results_by_cat: dict[str, list[dict]] = {}
+
+        def _search_one(cat: str) -> tuple[str, list[dict]]:
+            if _report:
+                with _report.stage(f"chroma查询({cat})"):
+                    return cat, _single_category_query(col, query, cat, per_k)
+            return cat, _single_category_query(col, query, cat, per_k)
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            for cat, hits in executor.map(lambda c: _search_one(c), cats):
+                results_by_cat[cat] = hits
+
+        merged = _merge_weighted(results_by_cat, settings.RAG_CATEGORY_WEIGHTS, k)
+        total_hits = sum(len(v) for v in results_by_cat.values())
+        logger.info(
+            "[rag] 加权合并检索: query=%r, 三路总命中=%d, 合并后=%d, 权重=%s",
+            query[:40], total_hits, len(merged), settings.RAG_CATEGORY_WEIGHTS,
+        )
+        return merged
+
+    # 情况 3：weighted=False 且未指定 category → 全局不过滤
     if _report:
-        with _report.stage("chroma查询(含embed)"):
+        with _report.stage("chroma查询(全局)"):
             result = col.query(
-                query_texts=[query],
-                n_results=k,
+                query_texts=[query], n_results=k,
                 include=["documents", "metadatas", "distances"],
             )
     else:
         result = col.query(
-            query_texts=[query],
-            n_results=k,
+            query_texts=[query], n_results=k,
             include=["documents", "metadatas", "distances"],
         )
     docs = result.get("documents", [[]])[0]
@@ -219,20 +357,10 @@ def retrieve(
     dists = (result.get("distances") or [[]])[0]
     out = []
     for doc, meta, dist in zip(docs, metas, dists):
-        # 余弦距离超过阈值视为不相关（如闲聊），直接丢弃，避免乱给参考资料
         if dist > settings.RAG_MAX_DISTANCE:
             continue
-        out.append({"content": doc, **(meta or {})})
-    dropped = len(docs) - len(out)
-    logger.info(
-        "[rag] 检索完成: query=%r, hits=%d, 过滤低相关=%d, 阈值=%.2f, 距离=%s, 集合数=%d",
-        query[:40],
-        len(out),
-        dropped,
-        settings.RAG_MAX_DISTANCE,
-        [f"{d:.3f}" for d in dists],
-        col.count(),
-    )
+        out.append({"content": doc, "distance": dist, **(meta or {})})
+    logger.info("[rag] 全局检索: query=%r, hits=%d", query[:40], len(out))
     return out
 
 
