@@ -93,6 +93,22 @@ def ingest_file(
     return ingest_text(text, metadata=metadata, collection=collection, source=os.path.basename(file_path))
 
 
+def html_to_text(content: bytes) -> tuple[str, str]:
+    """HTML 字节流 → (正文文本, <title>标题)。
+
+    去掉 script/style/noscript 标签，按行去空，供文件上传与 URL 抓取共用。
+    传入 bytes 由 BeautifulSoup 自动检测编码（支持 UTF-8/GBK 等中文网页）。
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(content, "lxml")
+    page_title = soup.title.get_text(strip=True) if soup.title else ""
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    text = "\n".join(line.strip() for line in soup.get_text("\n").splitlines() if line.strip())
+    return text, page_title
+
+
 def _extract_text(file_path: str) -> str:
     """按扩展名提取纯文本。"""
     ext = os.path.splitext(file_path)[1].lower()
@@ -100,6 +116,10 @@ def _extract_text(file_path: str) -> str:
         if ext in (".txt", ".md", ".markdown", ""):
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 return f.read()
+        if ext in (".html", ".htm"):
+            with open(file_path, "rb") as f:
+                text, _ = html_to_text(f.read())
+            return text
         if ext == ".pdf":
             import pdfplumber
 

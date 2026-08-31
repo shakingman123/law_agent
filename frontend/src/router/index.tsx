@@ -38,6 +38,7 @@ export const router = createHashRouter([
       { path: 'workbench', element: lazyPage(() => import('../pages/workbench')) },
       { path: 'calendar', element: lazyPage(() => import('../pages/calendar')) },
       { path: 'doclib', element: lazyPage(() => import('../pages/doclib')) },
+      { path: 'knowledge', element: lazyPage(() => import('../pages/knowledge')) },
       { path: 'cases/:id', element: lazyPage(() => import('../pages/case-detail')) },
       { path: 'settings', element: lazyPage(() => import('../pages/settings')) },
     ],

@@ -21,6 +21,9 @@ langgraph-checkpoint-postgres
 chromadb
 python-docx
 pdfplumber
+# 网页入库解析（HTML 上传 / URL 抓取）
+beautifulsoup4
+lxml
 # 案件归档（病毒扫描 + 加密存储）
 clamd
 minio

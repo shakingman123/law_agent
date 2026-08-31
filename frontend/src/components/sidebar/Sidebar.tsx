@@ -2,21 +2,28 @@ import { Layout, Menu } from 'antd';
 import {
   CalendarOutlined,
   FileTextOutlined,
+  DatabaseOutlined,
   EditOutlined,
 } from '@ant-design/icons';
 import { useNavigate, useLocation } from 'react-router-dom';
 import type { MenuProps } from 'antd';
 import UserCard from './UserCard';
+import { useAuthStore } from '../../stores/authStore';
 import { colors } from '../../theme/tokens';
 
 const { Sider } = Layout;
 
 type MenuItem = Required<MenuProps>['items'][number];
 
-const menuItems: MenuItem[] = [
+const baseMenuItems: MenuItem[] = [
   { key: '/workbench', icon: <EditOutlined />, label: '工作台' },
   { key: '/calendar', icon: <CalendarOutlined />, label: '日程列表' },
   { key: '/doclib', icon: <FileTextOutlined />, label: '文档库' },
+];
+
+/** 管理员专属菜单 */
+const adminMenuItems: MenuItem[] = [
+  { key: '/knowledge', icon: <DatabaseOutlined />, label: '知识库' },
 ];
 
 /**
@@ -27,7 +34,9 @@ const menuItems: MenuItem[] = [
 export default function Sidebar() {
   const navigate = useNavigate();
   const location = useLocation();
+  const user = useAuthStore((s) => s.user);
   const selectedKey = '/' + (location.pathname.split('/')[1] || 'workbench');
+  const menuItems: MenuItem[] = user?.isAdmin ? [...baseMenuItems, ...adminMenuItems] : baseMenuItems;
 
   return (
     <Sider

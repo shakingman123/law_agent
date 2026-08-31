@@ -226,3 +226,115 @@ def search_multi(
     all_hits.sort(key=lambda r: r.get("score", 0), reverse=True)
     logger.info("[qdrant] 多路检索合并: query=%r, total=%d", query[:40], len(all_hits))
     return all_hits
+
+
+def ingest_document(
+    text: str,
+    title: str = "",
+    collection: str = settings.QDRANT_COLLECTION_LAW,
+    metadata: Optional[dict] = None,
+) -> int:
+    """将整篇文档切块后入库（复用 Chroma 的切块器保证切分一致），返回入库块数。
+
+    Qdrant 侧单 point 不适合长文档，入库前先按 500 字符切块；
+    每块携带 chunk_index / total_chunks 便于管理界面按文档聚合展示。
+    """
+    if not text or not text.strip():
+        return 0
+    from app.rag.store import _splitter
+
+    chunks = _splitter.split_text(text)
+    if not chunks:
+        return 0
+    ok = 0
+    for i, chunk in enumerate(chunks):
+        meta = {**(metadata or {}), "chunk_index": i, "total_chunks": len(chunks)}
+        if ingest(chunk, title=title, collection=collection, metadata=meta):
+            ok += 1
+    logger.info("[qdrant] 文档入库完成: collection=%s, title=%s, chunks=%d/%d", collection, title, ok, len(chunks))
+    return ok
+
+
+def scroll_points(
+    collection: str,
+    limit: int = 20,
+    offset: Optional[str] = None,
+) -> dict:
+    """分页列出集合条目（管理界面用），返回 {points, next_offset}。
+
+    next_offset 为不透明分页令牌（Qdrant 为 point id，Chroma 回退为数字偏移），
+    为 None 表示已到末尾。
+    """
+    client = _get_client()
+    if client is None:
+        # Chroma 回退：col.get 数字偏移分页
+        try:
+            from app.rag.store import _get_collection
+
+            col = _get_collection(collection)
+            data = col.get(limit=limit, offset=int(offset) if offset else 0, include=["documents", "metadatas"])
+            ids = data.get("ids") or []
+            docs = data.get("documents") or []
+            metas = data.get("metadatas") or []
+            points = []
+            for i, pid in enumerate(ids):
+                meta = metas[i] if i < len(metas) else {}
+                points.append({
+                    "id": pid,
+                    "title": (meta or {}).get("title", (meta or {}).get("source", "")),
+                    "content": docs[i] if i < len(docs) else "",
+                    **(meta or {}),
+                })
+            has_more = len(ids) == limit
+            next_offset = str((int(offset) if offset else 0) + len(ids)) if has_more else None
+            return {"points": points, "next_offset": next_offset}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[qdrant] Chroma 列表回退失败: %s", e)
+            return {"points": [], "next_offset": None}
+
+    try:
+        records, next_offset = client.scroll(
+            collection_name=collection,
+            limit=limit,
+            offset=offset,
+            with_payload=True,
+        )
+        points = []
+        for rec in records:
+            payload = rec.payload or {}
+            points.append({
+                "id": str(rec.id),
+                "title": payload.get("title", ""),
+                "content": payload.get("content", ""),
+                **{k: v for k, v in payload.items() if k not in ("title", "content")},
+            })
+        return {"points": points, "next_offset": str(next_offset) if next_offset else None}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[qdrant] 列出条目失败: %s", e)
+        return {"points": [], "next_offset": None}
+
+
+def delete_point(collection: str, point_id: str) -> bool:
+    """删除单条向量（管理界面用）。"""
+    client = _get_client()
+    if client is None:
+        try:
+            from app.rag.store import _get_collection
+
+            _get_collection(collection).delete(ids=[point_id])
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[qdrant] Chroma 删除回退失败: %s", e)
+            return False
+    try:
+        from qdrant_client import models
+
+        client.delete(
+            collection_name=collection,
+            points_selector=models.PointIdsList(points_ids=[point_id]),
+        )
+        logger.info("[qdrant] 已删除: collection=%s, id=%s", collection, point_id)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[qdrant] 删除失败: %s", e)
+        return False

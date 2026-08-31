@@ -18,7 +18,7 @@ logging.basicConfig(
 )
 
 
-from app.api import auth, cases, chat, conversations, dev, files, llm, prompts, rag, schedules, templates
+from app.api import auth, cases, chat, conversations, dev, files, llm, prompts, rag, rag_admin, schedules, templates
 from app.core.config import settings
 from app.core.database import Base, engine, SessionLocal
 from app.core.security import hash_password
@@ -85,6 +85,7 @@ app.include_router(chat.router)
 app.include_router(cases.router)
 app.include_router(prompts.router)
 app.include_router(rag.router)
+app.include_router(rag_admin.router)
 app.include_router(files.router)
 app.include_router(conversations.router)
 app.include_router(templates.router)
