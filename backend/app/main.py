@@ -17,6 +17,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
+# 抑制 uvicorn.access 的响应体日志（SSE 流式 /blob data/ 刷屏，淹没真实错误）
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
 
 from app.api import auth, cases, chat, conversations, dev, files, llm, prompts, rag, rag_admin, schedules, templates
 from app.core.config import settings
