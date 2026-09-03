@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     CLAMAV_SOCKET: str = ""
     CLAMAV_HOST: str = "localhost"
     CLAMAV_PORT: int = 3310
+    # LibreOffice 命令路径（用于 .doc → .docx 格式转换）
+    # Windows 默认：C:/Program Files/LibreOffice/program/soffice.exe
+    # Linux  默认：/usr/bin/soffice
+    # 留空则自动查找 PATH；找不到 ole 格式直接降级为提示下载
+    LIBREOFFICE_BIN: str = ""
+    LIBREOFFICE_TIMEOUT: int = 30  # 单次转换超时（秒）
     # MinIO 对象存储（兼容 S3）
     MINIO_ENDPOINT: str = "localhost:9000"
     MINIO_ACCESS_KEY: str = "minioadmin"

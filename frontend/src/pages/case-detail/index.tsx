@@ -12,6 +12,7 @@ import {
   Upload,
   App,
   Descriptions,
+  Popconfirm,
 } from 'antd';
 import type { UploadFile } from 'antd';
 import {
@@ -24,6 +25,7 @@ import {
   DownloadOutlined,
   InboxOutlined,
   EyeOutlined,
+  DeleteOutlined,
 } from '@ant-design/icons';
 import { casesApi, type Case, type CaseDocument } from '../../api/cases';
 import { colors } from '../../theme/tokens';
@@ -104,6 +106,18 @@ export default function CaseDetail() {
       message.error('上传失败');
     } finally {
       setUploading(false);
+    }
+  };
+
+  const handleDelete = async (doc: CaseDocument): Promise<void> => {
+    try {
+      await casesApi.deleteDocument(caseId, doc.id);
+      message.success('文件已删除');
+      // 刷新案件数据
+      const updated = await casesApi.get(caseId);
+      setCaseData(updated);
+    } catch {
+      message.error('删除失败');
     }
   };
 
@@ -222,6 +236,24 @@ export default function CaseDetail() {
                       下载
                     </Button>
                   </a>,
+                  <Popconfirm
+                    key="delete"
+                    title="确认删除该文件？"
+                    description={doc.file_name}
+                    okText="删除"
+                    okButtonProps={{ danger: true }}
+                    cancelText="取消"
+                    onConfirm={() => handleDelete(doc)}
+                  >
+                    <Button
+                      type="link"
+                      danger
+                      icon={<DeleteOutlined />}
+                      style={{ padding: 0 }}
+                    >
+                      删除
+                    </Button>
+                  </Popconfirm>,
                 ].filter(Boolean)}
               >
                 <List.Item.Meta

@@ -169,3 +169,33 @@ def upload_case_document(
     db.commit()
     db.refresh(doc)
     return doc
+
+
+@router.delete("/{case_id}/documents/{doc_id}")
+def delete_case_document(
+    case_id: int,
+    doc_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """删除案件资料（同时从存储后端和数据库移除）。"""
+    case = db.get(Case, case_id)
+    if not case or case.owner_id != user.id:
+        raise HTTPException(status_code=404, detail="案件不存在")
+
+    doc = db.query(CaseDocument).filter(
+        CaseDocument.id == doc_id,
+        CaseDocument.case_id == case_id,
+    ).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    # 从存储后端删除（幂等，MinIO 和本地都会尝试）
+    storage.delete(doc.file_url)
+
+    # 从数据库删除
+    db.delete(doc)
+    case.updated_at = datetime.utcnow()
+    db.commit()
+
+    return {"ok": True, "deleted": doc_id}

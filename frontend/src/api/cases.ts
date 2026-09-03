@@ -60,4 +60,7 @@ export const casesApi = {
       })
       .then((r) => r.data);
   },
+
+  deleteDocument: (caseId: number, docId: number) =>
+    request.delete(`/cases/${caseId}/documents/${docId}`).then((r) => r.data),
 };

@@ -1,20 +1,28 @@
 """文件上传与访问接口。
 
 - POST /api/files/upload         通用文件上传（对话框附件用）
-- GET  /api/files/preview-text  提取 docx/pdf 文本（前端预览用）
+- GET  /api/files/preview-text  提取 docx/pdf/doc 文本（前端预览用）
 - GET  /api/files/{path}         访问已上传文件（inline 预览 / 下载）
 
 底层通过 StorageService 统一管理（MinIO 优先 + 本地回退）。
+.doc 旧版 Office 格式通过 LibreOffice 转 .docx 后再用 python-docx 提取。
 """
 import io
+import logging
 import os
+import shutil
+import subprocess
+import tempfile
 from typing import Optional
 
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
 
+from app.core.config import settings
 from app.core.deps import get_current_user
 from app.core.storage import storage, make_safe_name
+
+logger = logging.getLogger("app.api.files")
 
 router = APIRouter(prefix="/api/files", tags=["files"])
 
@@ -26,33 +34,224 @@ def _safe_path(rest: str) -> str:
     return rest
 
 
-def _extract_text_from_bytes(raw: bytes, filename: str) -> str:
-    """从文件字节提取文本，仅支持 docx（python-docx）和 pdf（PyMuPDF）。"""
-    ext = os.path.splitext(filename)[1].lower().lstrip(".")
+def _detect_real_format(raw: bytes, filename: str) -> str:
+    """用 magic byte 判断文件真实格式，扩展名仅作兜底。
 
-    if ext == "docx":
+    为什么不直接信扩展名？Word 有保存 bug：用户选另存为 .docx，
+    实际输出仍可能是 OLE 二进制。扩展名是 .docx，magic byte 却是 d0cf11e0。
+
+    识别规则：
+    - PK.......... → ZIP（真正的 .docx / .pptx / .xlsx）
+    - d0cf11e0a1b11ae1 → OLE（旧版 .doc / .ppt / .xls）
+    - 扩展名 .pdf → PDF（PyMuPDF 可自识别，容错）
+    """
+    magic = raw[:8]
+    if magic[:2] == b"PK":
+        return "zip"  # ZIP 容器，docx/xlsx/pptx 都是它
+    if magic[:4] == b"\xd0\xcf\x11\xe0":
+        return "ole"  # 旧版 Office 二进制
+    if magic[:4] == b"%PDF":
+        return "pdf"
+
+    # 兜底：信扩展名
+    ext = os.path.splitext(filename)[1].lower().lstrip(".")
+    return ext
+
+
+_libreoffice_cache: str | None = None  # 缓存查找结果，避免每次都 shutil.which
+
+
+def _find_libreoffice() -> str | None:
+    """查找 LibreOffice 可执行文件，优先用配置，再查 PATH。
+
+    返回绝对路径字符串，找不到返回 None。
+    """
+    global _libreoffice_cache
+    if _libreoffice_cache is not None:
+        return _libreoffice_cache
+
+    # 1. 显式配置
+    if settings.LIBREOFFICE_BIN:
+        if os.path.isfile(settings.LIBREOFFICE_BIN):
+            _libreoffice_cache = settings.LIBREOFFICE_BIN
+            logger.info("[preview-text] LibreOffice 已配置: %s", _libreoffice_cache)
+            return _libreoffice_cache
+        logger.warning(
+            "[preview-text] LIBREOFFICE_BIN 指向的文件不存在: %s，改为自动查找",
+            settings.LIBREOFFICE_BIN,
+        )
+
+    # 2. PATH 查找
+    for candidate in ("soffice", "libreoffice"):
+        found = shutil.which(candidate)
+        if found:
+            _libreoffice_cache = found
+            logger.info("[preview-text] LibreOffice 自动发现: %s", _libreoffice_cache)
+            return _libreoffice_cache
+
+    # 3. 常见硬编码路径兜底（Windows / macOS）
+    for hardcoded in (
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+    ):
+        if os.path.isfile(hardcoded):
+            _libreoffice_cache = hardcoded
+            logger.info("[preview-text] LibreOffice 硬编码发现: %s", _libreoffice_cache)
+            return _libreoffice_cache
+
+    _libreoffice_cache = ""  # 空串表示"查找过但没找到"
+    logger.warning("[preview-text] 未找到 LibreOffice — .doc/.xls/.ppt 无法预览")
+    return None
+
+
+def _ole_to_docx(raw: bytes, filename: str) -> bytes:
+    """用 LibreOffice 把 OLE 二进制（.doc/.xls/.ppt）转成 docx/xlsx/pptx。
+
+    内部逻辑：把 raw 写到临时目录 → soffice --headless --convert-to xxx
+    → 读出转换后的文件 → 返回字节 → 清理临时目录。
+
+    失败抛 HTTPException（带用户友好消息）。
+    """
+    soffice = _find_libreoffice()
+    if not soffice:
+        raise HTTPException(
+            status_code=400,
+            detail="服务器未安装 LibreOffice，无法预览 .doc/.xls/.ppt 文件。"
+            "请联系管理员安装 LibreOffice，或下载后用 Word/WPS 打开。",
+        )
+
+    # 根据扩展名决定要转换成什么
+    ext = os.path.splitext(filename)[1].lower().lstrip(".")
+    # OLE 格式的扩展名 → LibreOffice 转换目标格式
+    OLE_EXT_TO_TARGET = {
+        "doc": "docx",
+        "xls": "xlsx",
+        "ppt": "pptx",
+    }
+    # 如果 magic byte 是 OLE 但扩展名不匹配（用户说 docx 实际是 doc），默认当 doc 处理
+    target_ext = OLE_EXT_TO_TARGET.get(ext, "docx")
+
+    # 临时目录做转换（Windows 需要 CWD 也可写）
+    with tempfile.TemporaryDirectory(prefix="lawagent_ole_") as tmp:
+        # 输入文件
+        safe_in_name = f"source.{ext or 'doc'}"
+        in_path = os.path.join(tmp, safe_in_name)
+        with open(in_path, "wb") as fh:
+            fh.write(raw)
+
+        # LibreOffice 输出目录 = tmp（--convert-to 默认输出到当前目录）
+        # 注意：Windows 下 soffice 对路径里的斜杠敏感，全部用 os.path.join
+
+        try:
+            result = subprocess.run(
+                [
+                    soffice,
+                    "--headless",
+                    "--nologo",
+                    "--nodefault",
+                    "--nofirststartwizard",
+                    "--convert-to",
+                    target_ext,
+                    "--outdir",
+                    tmp,
+                    in_path,
+                ],
+                capture_output=True,
+                timeout=settings.LIBREOFFICE_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            raise HTTPException(
+                status_code=502,
+                detail=f"LibreOffice 转换超时（>{settings.LIBREOFFICE_TIMEOUT}s），"
+                "请稍后重试或下载后用 Word/WPS 打开。",
+            )
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(
+                status_code=502,
+                detail=f"LibreOffice 调用失败: {e}",
+            )
+
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            logger.error("[preview-text] LibreOffice 转换失败 rc=%s: %s", result.returncode, stderr[:300])
+            raise HTTPException(
+                status_code=400,
+                detail="LibreOffice 无法解析该文件（可能已损坏）。"
+                "请下载后用 Word/WPS 打开，或另存为 .docx 后重新上传。",
+            )
+
+        # 找到输出文件（LibreOffice 输出名 = 输入名去掉原扩展名 + 新扩展名）
+        out_name = f"source.{target_ext}"
+        out_path = os.path.join(tmp, out_name)
+        if not os.path.isfile(out_path):
+            # LibreOffice 有时用原文件名（带扩展名）+ 新扩展名
+            alt_out_name = f"source.{ext or 'doc'}.{target_ext}"
+            alt_out_path = os.path.join(tmp, alt_out_name)
+            if os.path.isfile(alt_out_path):
+                out_path = alt_out_path
+            else:
+                logger.error(
+                    "[preview-text] LibreOffice 未生成输出文件，临时目录内容: %s",
+                    os.listdir(tmp),
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail="LibreOffice 转换完成但未生成输出文件，请换一份源文件重试。",
+                )
+
+        with open(out_path, "rb") as fh:
+            return fh.read()
+
+
+def _extract_text_from_bytes(raw: bytes, filename: str) -> tuple[str, str]:
+    """从文件字节提取纯文本。
+
+    返回 (text, detected_format)。
+    """
+    real = _detect_real_format(raw, filename)
+
+    # 真实是 ZIP 容器：可能是 docx / xlsx / pptx，目前只支持 docx
+    if real == "zip":
         try:
             from docx import Document
             doc = Document(io.BytesIO(raw))
-            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=400, detail=f"docx 解析失败: {e}")
+            text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            return text, "docx"
+        except Exception:
+            # 不是 docx（可能是 xlsx / pptx），再试一下扩展名
+            ext = os.path.splitext(filename)[1].lower().lstrip(".")
+            if ext in ("xlsx", "pptx"):
+                raise HTTPException(status_code=400, detail=f"{ext} 暂不支持文本预览")
+            raise HTTPException(status_code=400, detail="docx 解析失败：文件可能已损坏")
 
-    if ext == "pdf":
+    if real == "pdf":
         try:
             import fitz  # PyMuPDF
             text_parts: list[str] = []
             with fitz.open(stream=raw, filetype="pdf") as doc:
                 for page in doc:
                     text_parts.append(page.get_text())
-            return "\n".join(text_parts)
+            return "\n".join(text_parts), "pdf"
         except Exception as e:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=f"PDF 解析失败: {e}")
 
-    # 其他格式（doc、图片、视频、txt 等）不支持文本提取
+    if real == "ole":
+        # 旧版 Office 二进制（.doc / .xls / .ppt）——先让 LibreOffice 转成现代格式
+        converted = _ole_to_docx(raw, filename)
+        # 转换后的字节重新走 zip 分支（docx/xlsx/pptx 都是 ZIP 容器）
+        return _extract_text_from_bytes(converted, f"converted.{os.path.splitext(filename)[1].lower() or 'doc'}x")
+
+    if real == "txt":
+        try:
+            return raw.decode("utf-8"), "txt"
+        except UnicodeDecodeError:
+            return raw.decode("gbk", errors="replace"), "txt"
+
+    # 其他未知格式
     raise HTTPException(
         status_code=400,
-        detail=f"不支持文本预览的文件类型: .{ext}",
+        detail=f"暂不支持文本预览的文件格式（magic={real}）",
     )
 
 
@@ -81,11 +280,10 @@ def preview_text(
     _safe_path(path)
     url = f"/api/files/{path}"
     raw = storage.download(url)
-    text = _extract_text_from_bytes(raw, path)
-    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    text, detected = _extract_text_from_bytes(raw, path)
     return {
         "text": text,
-        "file_type": ext,
+        "file_type": detected,
         "max_excerpt": len(text) > 10000,  # 超过 1 万字标记一下（前端可提示）
     }
 
