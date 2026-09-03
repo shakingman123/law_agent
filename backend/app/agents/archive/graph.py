@@ -6,8 +6,7 @@
 
 脱敏采用纯本地方案（正则 + spaCy NER），详见 desensitize.py。
 病毒扫描通过 ClamAV 守护进程（clamd）；守护进程不可用时 fail-open（仅记录日志）。
-加密使用 Fernet（AES-128-CBC + HMAC），复用 security.py 中的 _fernet 实例。
-存储优先上传至 MinIO；MinIO 不可用时回退到本地加密文件存储。
+加密与存储统一走 StorageService（MinIO 优先 / 本地回退，Fernet AES 内置）。
 """
 from __future__ import annotations
 
@@ -20,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.agents.archive.desensitize import desensitize_file
 from app.core.config import settings
-from app.core.security import _fernet
+from app.core.storage import storage
 from app.models.legal_reference import LegalReference
 from app.models.user import User
 
@@ -72,50 +71,13 @@ def _scan_with_clamav(file_path: str) -> bool:
 
 
 def _encrypt_and_store(file_path: str, file_name: str) -> str:
-    """AES 加密文件并上传至 MinIO；MinIO 不可用时回退到本地存储。
+    """读取文件 → Fernet AES 加密 → 上传存储（MinIO 优先 / 本地回退）。
 
-    返回加密后的文件 URL（MinIO 路径或本地路径）。
+    存储与加密能力全部委托 StorageService，返回对外可访问的 URL。
     """
     with open(file_path, "rb") as f:
         raw = f.read()
-    encrypted = _fernet.encrypt(raw)
-
-    # 尝试上传至 MinIO
-    try:
-        from io import BytesIO
-
-        from minio import Minio
-
-        client = Minio(
-            settings.MINIO_ENDPOINT,
-            access_key=settings.MINIO_ACCESS_KEY,
-            secret_key=settings.MINIO_SECRET_KEY,
-            secure=settings.MINIO_SECURE,
-        )
-        if not client.bucket_exists(settings.MINIO_BUCKET):
-            client.make_bucket(settings.MINIO_BUCKET)
-        object_name = f"encrypted/{file_name}"
-        client.put_object(
-            settings.MINIO_BUCKET,
-            object_name,
-            BytesIO(encrypted),
-            length=len(encrypted),
-        )
-        url = f"/minio/{settings.MINIO_BUCKET}/{object_name}"
-        logger.info("[store] 文件已加密并上传至 MinIO: %s", url)
-        return url
-    except Exception as e:  # noqa: BLE001
-        logger.warning("[store] MinIO 不可用，回退本地存储: %s", e)
-
-    # 回退：保存加密文件到本地
-    enc_dir = os.path.join(settings.UPLOAD_DIR, "encrypted")
-    os.makedirs(enc_dir, exist_ok=True)
-    enc_path = os.path.join(enc_dir, f"{file_name}.enc")
-    with open(enc_path, "wb") as f:
-        f.write(encrypted)
-    url = f"/api/files/encrypted/{file_name}.enc"
-    logger.info("[store] 文件已加密并保存至本地: %s", url)
-    return url
+    return storage.upload_encrypted(raw, file_name)
 
 
 def build_archive_graph(user: User, db: Session):

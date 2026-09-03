@@ -12,32 +12,15 @@ import os
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
-from app.core.config import settings
 from app.core.deps import get_current_user, get_db
+from app.core.storage import storage, make_safe_name
 from app.models.case import Case, CaseDocument
 from app.models.user import User
 from app.schemas.case import CaseCreate, CaseOut, CaseDocumentOut
 
 router = APIRouter(prefix="/api/cases", tags=["cases"])
-
-
-def _save_upload(file: UploadFile, subdir: str = "") -> tuple[str, str, int]:
-    """保存上传文件到 UPLOAD_DIR，返回 (file_url, file_name, file_size)。"""
-    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    target_dir = os.path.join(settings.UPLOAD_DIR, subdir) if subdir else settings.UPLOAD_DIR
-    os.makedirs(target_dir, exist_ok=True)
-
-    # 加时间戳避免重名
-    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    safe_name = f"{ts}_{file.filename}"
-    dest = os.path.join(target_dir, safe_name)
-    with open(dest, "wb") as f:
-        data = file.file.read()
-        f.write(data)
-    url = f"/api/files/{subdir}/{safe_name}" if subdir else f"/api/files/{safe_name}"
-    return url, file.filename, len(data)
 
 
 def _file_type(filename: str) -> str:
@@ -95,6 +78,7 @@ def recent_cases(
     week_ago = datetime.utcnow() - timedelta(days=7)
     cases = (
         db.query(Case)
+        .options(joinedload(Case.documents))
         .filter(Case.owner_id == user.id, Case.last_opened_at >= week_ago)
         .order_by(Case.last_opened_at.desc())
         .all()
@@ -110,6 +94,7 @@ def list_cases(
     """全部案件（文档库用，含文档类型聚合）。"""
     cases = (
         db.query(Case)
+        .options(joinedload(Case.documents))
         .filter(Case.owner_id == user.id)
         .order_by(Case.updated_at.desc())
         .all()
@@ -123,8 +108,13 @@ def get_case(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    case = db.get(Case, case_id)
-    if not case or case.owner_id != user.id:
+    case = (
+        db.query(Case)
+        .options(joinedload(Case.documents))
+        .filter(Case.id == case_id, Case.owner_id == user.id)
+        .first()
+    )
+    if not case:
         raise HTTPException(status_code=404, detail="案件不存在")
     return case
 
@@ -136,8 +126,13 @@ def touch_case(
     db: Session = Depends(get_db),
 ):
     """更新最近打开时间（点开案件时调用）。"""
-    case = db.get(Case, case_id)
-    if not case or case.owner_id != user.id:
+    case = (
+        db.query(Case)
+        .options(joinedload(Case.documents))
+        .filter(Case.id == case_id, Case.owner_id == user.id)
+        .first()
+    )
+    if not case:
         raise HTTPException(status_code=404, detail="案件不存在")
     case.last_opened_at = datetime.utcnow()
     db.commit()
@@ -152,17 +147,19 @@ def upload_case_document(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """上传案件资料文件。"""
+    """上传案件资料文件（通过 StorageService，MinIO 优先 / 本地回退）。"""
     case = db.get(Case, case_id)
     if not case or case.owner_id != user.id:
         raise HTTPException(status_code=404, detail="案件不存在")
 
-    url, name, size = _save_upload(file, subdir=f"case_{case_id}")
+    raw = file.file.read()
+    object_name, _safe = make_safe_name(file.filename, subdir=f"case_{case_id}")
+    url, size = storage.upload_plain(raw, object_name)
     doc = CaseDocument(
         case_id=case_id,
-        file_name=name,
+        file_name=file.filename,
         file_url=url,
-        file_type=_file_type(name),
+        file_type=_file_type(file.filename),
         file_size=size,
         uploaded_by=user.id,
     )

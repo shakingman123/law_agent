@@ -7,6 +7,7 @@
 from datetime import datetime
 
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy.orm import relationship
 
 from app.core.database import Base
 
@@ -32,6 +33,8 @@ class Case(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    documents = relationship("CaseDocument", back_populates="case", cascade="all, delete-orphan")
+
 
 class CaseDocument(Base):
     """案件资料文档（上传的文件）。"""
@@ -46,3 +49,5 @@ class CaseDocument(Base):
     file_size = Column(Integer, default=0)
     uploaded_by = Column(Integer, ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    case = relationship("Case", back_populates="documents")

@@ -2,15 +2,16 @@
 
 - POST /api/files/upload   通用文件上传（对话框附件用）
 - GET  /api/files/{path}    访问已上传文件
+
+底层通过 StorageService 统一管理（MinIO 优先 + 本地回退）。
 """
 import os
-from datetime import datetime
 
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, UploadFile, File
+from fastapi.responses import FileResponse, StreamingResponse
 
-from app.core.config import settings
 from app.core.deps import get_current_user
+from app.core.storage import storage, make_safe_name
 
 router = APIRouter(prefix="/api/files", tags=["files"])
 
@@ -21,28 +22,25 @@ def upload_file(
     user=Depends(get_current_user),
 ):
     """通用文件上传，返回访问 URL 与文件信息。"""
-    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    safe_name = f"{ts}_{file.filename}"
-    dest = os.path.join(settings.UPLOAD_DIR, safe_name)
-    with open(dest, "wb") as f:
-        data = file.file.read()
-        f.write(data)
+    raw = file.file.read()
+    object_name, _safe = make_safe_name(file.filename)
+    url, size = storage.upload_plain(raw, object_name)
     return {
-        "url": f"/api/files/{safe_name}",
+        "url": url,
         "file_name": file.filename,
-        "file_size": len(data),
+        "file_size": size,
         "file_type": os.path.splitext(file.filename)[1].lower().lstrip("."),
     }
 
 
 @router.get("/{rest:path}")
-def serve_file(rest: str):
-    """访问已上传文件（支持子路径，如 case_1/xxx.pdf）。"""
-    # 防目录穿越
+def serve_file(rest: str) -> StreamingResponse | FileResponse:
+    """访问已上传文件（支持子路径，如 case_1/xxx.pdf）。
+
+    防目录穿越：禁止 .. 和绝对路径。
+    """
     if ".." in rest or rest.startswith("/"):
+        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="非法路径")
-    full = os.path.join(settings.UPLOAD_DIR, rest)
-    if not os.path.isfile(full):
-        raise HTTPException(status_code=404, detail="文件不存在")
-    return FileResponse(full)
+    url = f"/api/files/{rest}"
+    return storage.serve_file_response(url)
