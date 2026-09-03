@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Modal, Spin, Empty, Typography, App } from 'antd';
+import { Modal, Spin, Empty, Typography } from 'antd';
 import { colors } from '../../theme/tokens';
 import request from '../../api/request';
 
@@ -27,10 +27,8 @@ export default function FilePreviewModal({
   open,
   fileUrl,
   fileName,
-  fileType,
   onClose,
 }: FilePreviewModalProps) {
-  const { message } = App.useApp();
   const [loading, setLoading] = useState(false);
   const [text, setText] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -47,7 +45,6 @@ export default function FilePreviewModal({
   const isImage = IMAGE_EXTS.has(ext);
   const isVideo = VIDEO_EXTS.has(ext);
   const canTextPreview = TEXT_PREVIEW_EXTS.has(ext);
-  const canPreview = canEmbed || isImage || isVideo || canTextPreview;
 
   // 弹窗打开时按需加载文本（docx / txt）
   useEffect(() => {
