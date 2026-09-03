@@ -23,9 +23,11 @@ import {
   PaperClipOutlined,
   DownloadOutlined,
   InboxOutlined,
+  EyeOutlined,
 } from '@ant-design/icons';
 import { casesApi, type Case, type CaseDocument } from '../../api/cases';
 import { colors } from '../../theme/tokens';
+import FilePreviewModal from '../../components/chat/FilePreviewModal';
 
 const scopeConfig: Record<string, { color: string; label: string }> = {
   private: { color: colors.green, label: '私库' },
@@ -59,8 +61,19 @@ export default function CaseDetail() {
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [fileList, setFileList] = useState<UploadFile[]>([]);
+  const [previewTarget, setPreviewTarget] = useState<CaseDocument | null>(null);
 
   const caseId = id ? parseInt(id, 10) : 0;
+
+  // 判断文件能否在线预览
+  const canPreviewDoc = (doc: CaseDocument): boolean => {
+    const ext = doc.file_name.split('.').pop()?.toLowerCase() || '';
+    const EMBED = new Set(['pdf']);
+    const IMG = new Set(['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']);
+    const VID = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'm4v']);
+    const TXT = new Set(['docx', 'txt']);
+    return EMBED.has(ext) || IMG.has(ext) || VID.has(ext) || TXT.has(ext);
+  };
 
   useEffect(() => {
     if (!caseId) return;
@@ -113,6 +126,7 @@ export default function CaseDetail() {
   const documents = caseData.documents || [];
 
   return (
+    <>
     <div style={{ padding: 24, height: '100%', overflow: 'auto', background: colors.background }}>
       {/* 返回栏 */}
       <div style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -184,6 +198,17 @@ export default function CaseDetail() {
             renderItem={(doc: CaseDocument) => (
               <List.Item
                 actions={[
+                  canPreviewDoc(doc) && (
+                    <Button
+                      key="preview"
+                      type="link"
+                      icon={<EyeOutlined />}
+                      style={{ padding: 0 }}
+                      onClick={() => setPreviewTarget(doc)}
+                    >
+                      预览
+                    </Button>
+                  ),
                   <a
                     key="download"
                     href={doc.file_url}
@@ -197,7 +222,7 @@ export default function CaseDetail() {
                       下载
                     </Button>
                   </a>,
-                ]}
+                ].filter(Boolean)}
               >
                 <List.Item.Meta
                   avatar={fileIcon[doc.file_type || ''] || <FileTextOutlined />}
@@ -214,5 +239,14 @@ export default function CaseDetail() {
         )}
       </Card>
     </div>
+
+    <FilePreviewModal
+      open={!!previewTarget}
+      fileUrl={previewTarget?.file_url || ''}
+      fileName={previewTarget?.file_name || ''}
+      fileType={previewTarget?.file_type || null}
+      onClose={() => setPreviewTarget(null)}
+    />
+    </>
   );
 }
