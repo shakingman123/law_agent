@@ -40,6 +40,8 @@ dist-ssr/
 *.tsbuildinfo
 .vite/
 *.local
+frontend/vite.config.js
+frontend/vite.config.d.ts
 
 npm-debug.log*
 yarn-debug.log*
