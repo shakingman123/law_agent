@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     # 留空则自动查找 PATH；找不到 ole 格式直接降级为提示下载
     LIBREOFFICE_BIN: str = ""
     LIBREOFFICE_TIMEOUT: int = 30  # 单次转换超时（秒）
+    # LibreOffice 转换工作目录（源文件/输出文件/profile 都放这里）
+    # 留空则用部署目录下 ./lo_work。切勿放在 /tmp：snap 版 LibreOffice 有
+    # 私有的 /tmp 命名空间，会读不到后端写入的源文件（报 source file could not be loaded）
+    LIBREOFFICE_WORK_DIR: str = ""
     # MinIO 对象存储（兼容 S3）
     MINIO_ENDPOINT: str = "localhost:9000"
     MINIO_ACCESS_KEY: str = "minioadmin"

@@ -12,7 +12,7 @@ import logging
 import os
 import shutil
 import subprocess
-import tempfile
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -106,6 +106,43 @@ def _find_libreoffice() -> str | None:
     return None
 
 
+def _is_snap_soffice(soffice: str) -> bool:
+    """检测是否为 snap 版 LibreOffice（/snap/bin/... 或软链指向 /snap/）。
+
+    snap 版运行在独立沙箱里，拥有私有的 /tmp 挂载命名空间：后端写到
+    系统 /tmp 的源文件它根本看不到，会报 "source file could not be loaded"。
+    """
+    try:
+        real = os.path.realpath(soffice)
+    except OSError:
+        real = soffice
+    return real.startswith("/snap/") or real.startswith("/var/lib/snapd/")
+
+
+def _lo_work_dir(under_home: bool = False) -> str:
+    """创建本次 LibreOffice 转换的独立工作目录并返回其绝对路径。
+
+    刻意不使用系统临时目录（tempfile 默认 /tmp）：
+    - snap 版 LibreOffice 有私有 /tmp 命名空间，读不到 /tmp 下的源文件；
+    - 部分服务器 /tmp 挂载了 noexec 或被 systemd 隔离。
+
+    under_home=True（snap 版）时放到服务用户的 $HOME 下：snap 的 AppArmor
+    home interface 只放行 $HOME 下的非隐藏路径，部署目录（/var/www 等）读不到。
+    可用 LIBREOFFICE_WORK_DIR 显式覆盖。每次转换用 uuid 子目录隔离，
+    调用方负责在 finally 中清理。
+    """
+    if settings.LIBREOFFICE_WORK_DIR:
+        base = os.path.abspath(settings.LIBREOFFICE_WORK_DIR)
+    elif under_home:
+        base = os.path.join(str(Path.home()), "lo_work")
+    else:
+        base = os.path.join(os.getcwd(), "lo_work")
+    os.makedirs(base, exist_ok=True)
+    work = os.path.join(base, f"job_{uuid.uuid4().hex}")
+    os.makedirs(work, exist_ok=True)
+    return work
+
+
 def _lo_diag(rc: int, stdout: str, stderr: str) -> str:
     """把 LibreOffice 的 rc/stdout/stderr 拼成简短诊断后缀，便于前端/日志定位。"""
     lines = [ln.strip() for ln in (stderr or stdout).splitlines() if ln.strip()]
@@ -116,8 +153,9 @@ def _lo_diag(rc: int, stdout: str, stderr: str) -> str:
 def _ole_to_docx(raw: bytes, filename: str) -> bytes:
     """用 LibreOffice 把 OLE 二进制（.doc/.xls/.ppt）转成 docx/xlsx/pptx。
 
-    内部逻辑：把 raw 写到临时目录 → soffice --headless --convert-to xxx
-    → 读出转换后的文件 → 返回字节 → 清理临时目录。
+    内部逻辑：把 raw 写到独立工作目录（lo_work/，不用系统 /tmp）
+    → soffice --headless --convert-to xxx → 读出转换后的文件 → 返回字节
+    → finally 清理工作目录。
 
     失败抛 HTTPException（带用户友好消息）。
     """
@@ -140,30 +178,38 @@ def _ole_to_docx(raw: bytes, filename: str) -> bytes:
     # 如果 magic byte 是 OLE 但扩展名不匹配（用户说 docx 实际是 doc），默认当 doc 处理
     target_ext = OLE_EXT_TO_TARGET.get(ext, "docx")
 
-    # 临时目录做转换（Windows 需要 CWD 也可写）
-    with tempfile.TemporaryDirectory(prefix="lawagent_ole_") as tmp:
+    snap = _is_snap_soffice(soffice)
+    if snap:
+        logger.warning(
+            "[preview-text] 检测到 snap 版 LibreOffice(%s)：其私有 /tmp 沙箱会导致"
+            "“source file could not be loaded”，建议改装 deb 版："
+            "sudo snap remove libreoffice && sudo apt-get install -y libreoffice-writer",
+            soffice,
+        )
+
+    # 工作目录（源文件/输出/profile 都放这里）。不能用系统 /tmp，见 _lo_work_dir 说明
+    # snap 版放到 $HOME 下（其 AppArmor 只放行 home），deb 版放部署目录下
+    work = _lo_work_dir(under_home=snap)
+    try:
         # 输入文件
         safe_in_name = f"source.{ext or 'doc'}"
-        in_path = os.path.join(tmp, safe_in_name)
+        in_path = os.path.join(work, safe_in_name)
         with open(in_path, "wb") as fh:
             fh.write(raw)
 
-        # LibreOffice 输出目录 = tmp（--convert-to 默认输出到当前目录）
-        # 注意：Windows 下 soffice 对路径里的斜杠敏感，全部用 os.path.join
-
-        # 关键：为本次转换指定独立的用户 profile 目录（放在可写的 tmp 内）。
+        # 关键：为本次转换指定独立的用户 profile 目录（放在可写的工作目录内）。
         # 否则在 systemd 等服务器环境下会出现经典的"rc=0 但没有输出文件"：
         #   1. HOME 不可写 / 被 ProtectHome 隔离 → 默认 profile (~/.config/libreoffice)
         #      初始化失败，soffice 静默退出不转换；
         #   2. 残留 soffice 进程或并发转换共用默认 profile → 新调用经 UNO 管道
         #      把任务转发给旧实例后立即退出，旧实例卡住则无输出。
-        profile_dir = os.path.join(tmp, "lo_profile")
+        profile_dir = os.path.join(work, "lo_profile")
         os.makedirs(profile_dir, exist_ok=True)
         profile_uri = Path(profile_dir).as_uri()  # file:///... 跨平台格式
 
         # systemd 下 HOME 可能缺失，fontconfig/javaldx 等组件仍会用到，补一个兜底
         env = os.environ.copy()
-        env.setdefault("HOME", tmp)
+        env["HOME"] = work
 
         try:
             result = subprocess.run(
@@ -178,7 +224,7 @@ def _ole_to_docx(raw: bytes, filename: str) -> bytes:
                     "--convert-to",
                     target_ext,
                     "--outdir",
-                    tmp,
+                    work,
                     in_path,
                 ],
                 capture_output=True,
@@ -199,6 +245,7 @@ def _ole_to_docx(raw: bytes, filename: str) -> bytes:
 
         stdout = result.stdout.decode("utf-8", errors="replace")
         stderr = result.stderr.decode("utf-8", errors="replace")
+        combined = f"{stdout}\n{stderr}"
 
         if result.returncode != 0:
             logger.error(
@@ -217,34 +264,50 @@ def _ole_to_docx(raw: bytes, filename: str) -> bytes:
 
         # 找到输出文件（LibreOffice 输出名 = 输入名去掉原扩展名 + 新扩展名）
         out_name = f"source.{target_ext}"
-        out_path = os.path.join(tmp, out_name)
-        if not os.path.isfile(out_path):
+        out_path = os.path.join(work, out_name)
+        if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
             # LibreOffice 有时用原文件名（带扩展名）+ 新扩展名
             alt_out_name = f"source.{ext or 'doc'}.{target_ext}"
-            alt_out_path = os.path.join(tmp, alt_out_name)
-            if os.path.isfile(alt_out_path):
+            alt_out_path = os.path.join(work, alt_out_name)
+            if os.path.isfile(alt_out_path) and os.path.getsize(alt_out_path) > 0:
                 out_path = alt_out_path
             else:
                 logger.error(
                     "[preview-text] LibreOffice rc=%s 未生成输出文件\n"
-                    "stdout: %s\nstderr: %s\n临时目录内容: %s",
+                    "stdout: %s\nstderr: %s\n工作目录内容: %s",
                     result.returncode,
                     stdout[:500],
                     stderr[:500],
-                    os.listdir(tmp),
+                    os.listdir(work),
                 )
                 diag = _lo_diag(result.returncode, stdout, stderr)
+                hint = ""
+                if snap and "could not be loaded" in combined.lower():
+                    # snap 沙箱（私有 /tmp、AppArmor）读不到后端给它的源文件
+                    hint = (
+                        "检测到服务器使用 snap 版 LibreOffice，其沙箱会导致无法读取源文件，"
+                        "请在服务器执行：sudo snap remove libreoffice；"
+                        "sudo apt-get update && sudo apt-get install -y libreoffice-writer，"
+                        "然后重启服务。"
+                    )
+                elif "could not be loaded" in combined.lower():
+                    hint = (
+                        "LibreOffice 无法读取源文件，常见于工作目录权限不足或磁盘空间不足；"
+                        "可在服务器手动执行 `sudo -u <服务用户> soffice --headless "
+                        "--convert-to docx --outdir /tmp 某.doc` 复现排查。"
+                    )
                 raise HTTPException(
                     status_code=400,
                     detail="LibreOffice 转换完成但未生成输出文件。"
-                    "请联系管理员检查服务器 LibreOffice 运行环境"
-                    "（可用 `sudo -u <服务用户> soffice --headless --convert-to docx 某.doc` 手动复现），"
-                    "或下载后用 Word/WPS 打开。"
+                    + hint
+                    + "也可以下载后用 Word/WPS 打开。"
                     + diag,
                 )
 
         with open(out_path, "rb") as fh:
             return fh.read()
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def _extract_text_from_bytes(raw: bytes, filename: str) -> tuple[str, str]:
