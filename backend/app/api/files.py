@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query
@@ -105,6 +106,13 @@ def _find_libreoffice() -> str | None:
     return None
 
 
+def _lo_diag(rc: int, stdout: str, stderr: str) -> str:
+    """把 LibreOffice 的 rc/stdout/stderr 拼成简短诊断后缀，便于前端/日志定位。"""
+    lines = [ln.strip() for ln in (stderr or stdout).splitlines() if ln.strip()]
+    tail = "；".join(lines[-2:])[:200] if lines else "无错误输出"
+    return f"（诊断：rc={rc}，{tail}）"
+
+
 def _ole_to_docx(raw: bytes, filename: str) -> bytes:
     """用 LibreOffice 把 OLE 二进制（.doc/.xls/.ppt）转成 docx/xlsx/pptx。
 
@@ -143,13 +151,29 @@ def _ole_to_docx(raw: bytes, filename: str) -> bytes:
         # LibreOffice 输出目录 = tmp（--convert-to 默认输出到当前目录）
         # 注意：Windows 下 soffice 对路径里的斜杠敏感，全部用 os.path.join
 
+        # 关键：为本次转换指定独立的用户 profile 目录（放在可写的 tmp 内）。
+        # 否则在 systemd 等服务器环境下会出现经典的"rc=0 但没有输出文件"：
+        #   1. HOME 不可写 / 被 ProtectHome 隔离 → 默认 profile (~/.config/libreoffice)
+        #      初始化失败，soffice 静默退出不转换；
+        #   2. 残留 soffice 进程或并发转换共用默认 profile → 新调用经 UNO 管道
+        #      把任务转发给旧实例后立即退出，旧实例卡住则无输出。
+        profile_dir = os.path.join(tmp, "lo_profile")
+        os.makedirs(profile_dir, exist_ok=True)
+        profile_uri = Path(profile_dir).as_uri()  # file:///... 跨平台格式
+
+        # systemd 下 HOME 可能缺失，fontconfig/javaldx 等组件仍会用到，补一个兜底
+        env = os.environ.copy()
+        env.setdefault("HOME", tmp)
+
         try:
             result = subprocess.run(
                 [
                     soffice,
+                    f"-env:UserInstallation={profile_uri}",
                     "--headless",
                     "--nologo",
                     "--nodefault",
+                    "--norestore",
                     "--nofirststartwizard",
                     "--convert-to",
                     target_ext,
@@ -159,6 +183,7 @@ def _ole_to_docx(raw: bytes, filename: str) -> bytes:
                 ],
                 capture_output=True,
                 timeout=settings.LIBREOFFICE_TIMEOUT,
+                env=env,
             )
         except subprocess.TimeoutExpired:
             raise HTTPException(
@@ -172,13 +197,22 @@ def _ole_to_docx(raw: bytes, filename: str) -> bytes:
                 detail=f"LibreOffice 调用失败: {e}",
             )
 
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        stderr = result.stderr.decode("utf-8", errors="replace")
+
         if result.returncode != 0:
-            stderr = result.stderr.decode("utf-8", errors="replace")
-            logger.error("[preview-text] LibreOffice 转换失败 rc=%s: %s", result.returncode, stderr[:300])
+            logger.error(
+                "[preview-text] LibreOffice 转换失败 rc=%s\nstdout: %s\nstderr: %s",
+                result.returncode,
+                stdout[:500],
+                stderr[:500],
+            )
+            diag = _lo_diag(result.returncode, stdout, stderr)
             raise HTTPException(
                 status_code=400,
                 detail="LibreOffice 无法解析该文件（可能已损坏）。"
-                "请下载后用 Word/WPS 打开，或另存为 .docx 后重新上传。",
+                "请下载后用 Word/WPS 打开，或另存为 .docx 后重新上传。"
+                + diag,
             )
 
         # 找到输出文件（LibreOffice 输出名 = 输入名去掉原扩展名 + 新扩展名）
@@ -192,12 +226,21 @@ def _ole_to_docx(raw: bytes, filename: str) -> bytes:
                 out_path = alt_out_path
             else:
                 logger.error(
-                    "[preview-text] LibreOffice 未生成输出文件，临时目录内容: %s",
+                    "[preview-text] LibreOffice rc=%s 未生成输出文件\n"
+                    "stdout: %s\nstderr: %s\n临时目录内容: %s",
+                    result.returncode,
+                    stdout[:500],
+                    stderr[:500],
                     os.listdir(tmp),
                 )
+                diag = _lo_diag(result.returncode, stdout, stderr)
                 raise HTTPException(
                     status_code=400,
-                    detail="LibreOffice 转换完成但未生成输出文件，请换一份源文件重试。",
+                    detail="LibreOffice 转换完成但未生成输出文件。"
+                    "请联系管理员检查服务器 LibreOffice 运行环境"
+                    "（可用 `sudo -u <服务用户> soffice --headless --convert-to docx 某.doc` 手动复现），"
+                    "或下载后用 Word/WPS 打开。"
+                    + diag,
                 )
 
         with open(out_path, "rb") as fh:
