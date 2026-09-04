@@ -73,7 +73,7 @@ export default function CaseDetail() {
     const EMBED = new Set(['pdf']);
     const IMG = new Set(['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']);
     const VID = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'm4v']);
-    const TXT = new Set(['docx', 'txt']);
+    const TXT = new Set(['doc', 'docx', 'txt']);
     return EMBED.has(ext) || IMG.has(ext) || VID.has(ext) || TXT.has(ext);
   };
 

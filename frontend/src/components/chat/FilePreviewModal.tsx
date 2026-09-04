@@ -39,7 +39,7 @@ export default function FilePreviewModal({
   const EMBED_TYPES = new Set(['pdf']);
   const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']);
   const VIDEO_EXTS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'm4v']);
-  const TEXT_PREVIEW_EXTS = new Set(['docx', 'txt']);
+  const TEXT_PREVIEW_EXTS = new Set(['doc', 'docx', 'txt']);
 
   const canEmbed = EMBED_TYPES.has(ext);
   const isImage = IMAGE_EXTS.has(ext);

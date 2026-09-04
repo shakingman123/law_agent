@@ -54,6 +54,14 @@ request.interceptors.response.use(
     const silent: boolean | undefined = error.config?.silent;
 
     if (status === 401) {
+      // 登录/注册接口的 401 表示"凭据错误"（邮箱或密码错误），不是 token 过期：
+      // 不清登录态、不弹"登录已过期"、不触发 logout，直接展示后端返回的原因
+      const url = error.config?.url || '';
+      const isAuthRequest = url.includes('/auth/login') || url.includes('/auth/register');
+      if (isAuthRequest) {
+        if (!silent) staticMessage.error(detail);
+        return Promise.reject(error);
+      }
       // token 失效，清除并提示
       storage.remove('token');
       if (!hasShown401Warning) {
