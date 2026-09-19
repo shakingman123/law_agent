@@ -26,6 +26,7 @@ import logging
 import os
 from datetime import datetime
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
@@ -82,6 +83,20 @@ def _is_minio_url(url: str) -> bool:
     此函数始终返回 False —— URL 与后端解耦，下载时按需判断。
     """
     return False
+
+
+def _content_disposition(filename: str, inline: bool = True) -> str:
+    """构建 RFC 5987 兼容的 Content-Disposition 头。
+
+    HTTP 头只允许 latin-1 字符；中文文件名直接放进去会触发
+    “'latin-1' codec can't encode characters” 异常。
+    同时给出 ASCII 兜底文件名（filename=）和 UTF-8 编码文件名（filename*=），
+    兼容旧浏览器与现代浏览器。
+    """
+    disposition = "inline" if inline else "attachment"
+    ascii_name = filename.encode("ascii", "replace").decode("ascii")
+    utf8_name = quote(filename)
+    return f'{disposition}; filename="{ascii_name}"; filename*=UTF-8\'\'{utf8_name}'
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +299,7 @@ class StorageService:
                     resp.stream(32 * 1024),
                     media_type=media_type,
                     headers={
-                        "Content-Disposition": f'inline; filename="{filename}"',
+                        "Content-Disposition": _content_disposition(filename),
                         **({"Content-Length": content_length} if content_length else {}),
                     },
                     background=BackgroundTask(resp.close),
@@ -303,8 +318,9 @@ class StorageService:
             raise HTTPException(status_code=404, detail="文件不存在")
         return FileResponse(
             local_path,
-            filename=filename,
+            filename=None,
             media_type=_guess_media_type(local_path),
+            headers={"Content-Disposition": _content_disposition(filename)},
         )
 
     # ------------------------------------------------------------------
