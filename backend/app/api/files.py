@@ -12,6 +12,7 @@ import logging
 import os
 import shutil
 import subprocess
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -140,28 +141,51 @@ def _lo_has_import_filter(soffice: str, target_ext: str) -> bool:
     return any(os.path.isfile(os.path.join(prog_dir, lib)) for lib in libs)
 
 
-def _lo_work_dir(under_home: bool = False) -> str:
-    """创建本次 LibreOffice 转换的独立工作目录并返回其绝对路径。
+def _lo_candidate_bases(snap: bool) -> list[str]:
+    """返回转换工作根目录候选（按优先级），转换时逐个尝试、自动容错。
 
-    刻意不使用系统临时目录（tempfile 默认 /tmp）：
-    - snap 版 LibreOffice 有私有 /tmp 命名空间，读不到 /tmp 下的源文件；
-    - 部分服务器 /tmp 挂载了 noexec 或被 systemd 隔离。
-
-    under_home=True（snap 版）时放到服务用户的 $HOME 下：snap 的 AppArmor
-    home interface 只放行 $HOME 下的非隐藏路径，部署目录（/var/www 等）读不到。
-    可用 LIBREOFFICE_WORK_DIR 显式覆盖。每次转换用 uuid 子目录隔离，
-    调用方负责在 finally 中清理。
+    soffice 能读哪些路径受不同沙箱机制限制，单一目录策略在不同服务器上会踩坑：
+    - 显式 LIBREOFFICE_WORK_DIR：只用指定目录；
+    - snap 版：私有 /tmp 挂载命名空间 + AppArmor home interface，优先 $HOME；
+    - deb 版（Ubuntu）：libreoffice 包自带的 AppArmor profile 默认只放行
+      /tmp、/var/tmp、/home、/media 等路径，不放行 /var/www、/opt 等部署目录，
+      在部署目录下放源文件会被内核拒绝并报 rc=0 + "source file could not
+      be loaded"，因此优先系统临时目录，部署目录仅作兜底。
     """
     if settings.LIBREOFFICE_WORK_DIR:
-        base = os.path.abspath(settings.LIBREOFFICE_WORK_DIR)
-    elif under_home:
-        base = os.path.join(str(Path.home()), "lo_work")
-    else:
-        base = os.path.join(os.getcwd(), "lo_work")
+        return [os.path.abspath(settings.LIBREOFFICE_WORK_DIR)]
+    if snap:
+        return [os.path.join(str(Path.home()), "lo_work"), tempfile.gettempdir()]
+    return [tempfile.gettempdir(), os.path.join(os.getcwd(), "lo_work")]
+
+
+def _lo_make_job(base: str) -> str:
+    """在指定根目录下创建本次转换的独立工作目录（uuid 隔离，调用方负责清理）。"""
     os.makedirs(base, exist_ok=True)
-    work = os.path.join(base, f"job_{uuid.uuid4().hex}")
+    work = os.path.join(base, f"lo_job_{uuid.uuid4().hex}")
     os.makedirs(work, exist_ok=True)
     return work
+
+
+def _lo_missing_filter_deps(soffice: str, target_ext: str) -> list[str]:
+    """用 ldd 检查导入过滤器动态库是否有缺失的共享库依赖。
+
+    过滤器 .so 存在但依赖缺失时，过滤器加载失败，同样表现为
+    rc=0 + "source file could not be loaded"。返回缺失项描述列表。
+    """
+    lib = {"docx": "libmswordlo.so", "xlsx": "libscfiltlo.so"}.get(target_ext)
+    if not lib:
+        return []
+    lib_path = os.path.join(os.path.dirname(os.path.realpath(soffice)), lib)
+    if not os.path.isfile(lib_path):
+        return []
+    try:
+        out = subprocess.run(
+            ["ldd", lib_path], capture_output=True, timeout=10, text=True,
+        ).stdout
+    except Exception:  # noqa: BLE001
+        return []
+    return [ln.strip() for ln in out.splitlines() if "not found" in ln]
 
 
 def _lo_diag(rc: int, stdout: str, stderr: str) -> str:
@@ -223,137 +247,174 @@ def _ole_to_docx(raw: bytes, filename: str) -> bytes:
             "也可以下载后用 Word/WPS 打开。",
         )
 
-    # 工作目录（源文件/输出/profile 都放这里）。不能用系统 /tmp，见 _lo_work_dir 说明
-    # snap 版放到 $HOME 下（其 AppArmor 只放行 home），deb 版放部署目录下
-    work = _lo_work_dir(under_home=snap)
-    try:
-        # 输入文件
-        safe_in_name = f"source.{ext or 'doc'}"
-        in_path = os.path.join(work, safe_in_name)
-        with open(in_path, "wb") as fh:
-            fh.write(raw)
-
-        # 关键：为本次转换指定独立的用户 profile 目录（放在可写的工作目录内）。
-        # 否则在 systemd 等服务器环境下会出现经典的"rc=0 但没有输出文件"：
-        #   1. HOME 不可写 / 被 ProtectHome 隔离 → 默认 profile (~/.config/libreoffice)
-        #      初始化失败，soffice 静默退出不转换；
-        #   2. 残留 soffice 进程或并发转换共用默认 profile → 新调用经 UNO 管道
-        #      把任务转发给旧实例后立即退出，旧实例卡住则无输出。
-        profile_dir = os.path.join(work, "lo_profile")
-        os.makedirs(profile_dir, exist_ok=True)
-        profile_uri = Path(profile_dir).as_uri()  # file:///... 跨平台格式
-
-        # systemd 下 HOME 可能缺失，fontconfig/javaldx 等组件仍会用到，补一个兜底
-        env = os.environ.copy()
-        env["HOME"] = work
-
+    # 源文件/输出/profile 都放在每次转换独立的工作目录里。
+    # 不同发行版的沙箱对工作目录有不同限制（snap 私有 /tmp；Ubuntu deb 版自带的
+    # AppArmor profile 只放行 /tmp、/home 等，不放行 /var/www 部署目录），
+    # 因此按候选目录逐个尝试，第一个成功即用——无需手动改配置即可跨环境自愈。
+    bases = _lo_candidate_bases(snap)
+    last_diag = ""
+    last_combined = ""
+    last_rc: Optional[int] = None
+    last_in_size = -1
+    for attempt, base in enumerate(bases):
+        work = _lo_make_job(base)
         try:
-            result = subprocess.run(
-                [
-                    soffice,
-                    f"-env:UserInstallation={profile_uri}",
-                    "--headless",
-                    "--nologo",
-                    "--nodefault",
-                    "--norestore",
-                    "--nofirststartwizard",
-                    "--convert-to",
-                    target_ext,
-                    "--outdir",
-                    work,
-                    in_path,
-                ],
-                capture_output=True,
-                timeout=settings.LIBREOFFICE_TIMEOUT,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
-            raise HTTPException(
-                status_code=502,
-                detail=f"LibreOffice 转换超时（>{settings.LIBREOFFICE_TIMEOUT}s），"
-                "请稍后重试或下载后用 Word/WPS 打开。",
-            )
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(
-                status_code=502,
-                detail=f"LibreOffice 调用失败: {e}",
-            )
+            # 输入文件
+            safe_in_name = f"source.{ext or 'doc'}"
+            in_path = os.path.join(work, safe_in_name)
+            with open(in_path, "wb") as fh:
+                fh.write(raw)
 
-        stdout = result.stdout.decode("utf-8", errors="replace")
-        stderr = result.stderr.decode("utf-8", errors="replace")
-        combined = f"{stdout}\n{stderr}"
+            # 关键：为本次转换指定独立的用户 profile 目录（放在可写的工作目录内）。
+            # 否则在 systemd 等服务器环境下会出现经典的"rc=0 但没有输出文件"：
+            #   1. HOME 不可写 / 被 ProtectHome 隔离 → 默认 profile (~/.config/libreoffice)
+            #      初始化失败，soffice 静默退出不转换；
+            #   2. 残留 soffice 进程或并发转换共用默认 profile → 新调用经 UNO 管道
+            #      把任务转发给旧实例后立即退出，旧实例卡住则无输出。
+            profile_dir = os.path.join(work, "lo_profile")
+            os.makedirs(profile_dir, exist_ok=True)
+            profile_uri = Path(profile_dir).as_uri()  # file:///... 跨平台格式
 
-        if result.returncode != 0:
-            logger.error(
-                "[preview-text] LibreOffice 转换失败 rc=%s\nstdout: %s\nstderr: %s",
-                result.returncode,
-                stdout[:500],
-                stderr[:500],
-            )
-            diag = _lo_diag(result.returncode, stdout, stderr)
-            raise HTTPException(
-                status_code=400,
-                detail="LibreOffice 无法解析该文件（可能已损坏）。"
-                "请下载后用 Word/WPS 打开，或另存为 .docx 后重新上传。"
-                + diag,
-            )
+            # systemd 下 HOME 可能缺失；TMPDIR 也指到工作目录内，避免权限/沙箱问题
+            env = os.environ.copy()
+            env["HOME"] = work
+            env["TMPDIR"] = work
 
-        # 找到输出文件（LibreOffice 输出名 = 输入名去掉原扩展名 + 新扩展名）
-        out_name = f"source.{target_ext}"
-        out_path = os.path.join(work, out_name)
-        if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
-            # LibreOffice 有时用原文件名（带扩展名）+ 新扩展名
-            alt_out_name = f"source.{ext or 'doc'}.{target_ext}"
-            alt_out_path = os.path.join(work, alt_out_name)
-            if os.path.isfile(alt_out_path) and os.path.getsize(alt_out_path) > 0:
-                out_path = alt_out_path
-            else:
-                try:
-                    in_size = os.path.getsize(in_path)
-                except OSError:
-                    in_size = -1
+            try:
+                result = subprocess.run(
+                    [
+                        soffice,
+                        f"-env:UserInstallation={profile_uri}",
+                        "--headless",
+                        "--nologo",
+                        "--nodefault",
+                        "--norestore",
+                        "--nofirststartwizard",
+                        "--convert-to",
+                        target_ext,
+                        "--outdir",
+                        work,
+                        in_path,
+                    ],
+                    capture_output=True,
+                    timeout=settings.LIBREOFFICE_TIMEOUT,
+                    env=env,
+                )
+            except subprocess.TimeoutExpired:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"LibreOffice 转换超时（>{settings.LIBREOFFICE_TIMEOUT}s），"
+                    "请稍后重试或下载后用 Word/WPS 打开。",
+                )
+            except Exception as e:  # noqa: BLE001
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"LibreOffice 调用失败: {e}",
+                )
+
+            stdout = result.stdout.decode("utf-8", errors="replace")
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            combined = f"{stdout}\n{stderr}"
+
+            if result.returncode != 0:
+                # 非零退出属于文件级错误（损坏/无法解析），换工作目录重试没有意义
                 logger.error(
-                    "[preview-text] LibreOffice rc=%s 未生成输出文件\n"
-                    "源文件: %s（%d bytes）\nstdout: %s\nstderr: %s\n工作目录内容: %s",
+                    "[preview-text] LibreOffice 转换失败 rc=%s\nstdout: %s\nstderr: %s",
                     result.returncode,
-                    in_path,
-                    in_size,
                     stdout[:500],
                     stderr[:500],
-                    os.listdir(work),
                 )
                 diag = _lo_diag(result.returncode, stdout, stderr)
-                hint = ""
-                if snap and "could not be loaded" in combined.lower():
-                    # snap 沙箱（私有 /tmp、AppArmor）读不到后端给它的源文件
-                    hint = (
-                        "检测到服务器使用 snap 版 LibreOffice，其沙箱会导致无法读取源文件，"
-                        "请在服务器执行：sudo snap remove libreoffice；"
-                        "sudo apt-get update && sudo apt-get install -y libreoffice-writer，"
-                        "然后重启服务。"
-                    )
-                elif "could not be loaded" in combined.lower():
-                    # 到这里时：源文件由后端同一用户刚写入（无权限问题）、
-                    # 导入过滤器已预检存在、魔数确认是合法 OLE 文件。
-                    # 无头模式下最常见的原因是文件带密码加密（加密 .doc 也是合法 OLE），
-                    # 其次是文件内容损坏/变体格式。
-                    hint = (
-                        "最常见原因是文件本身带密码加密（LibreOffice 无头模式无法处理），"
-                        "其次是文件内容损坏。请先下载该文件用 Word/WPS 打开验证："
-                        "若提示输入密码或打不开，则与服务器无关。"
-                    )
                 raise HTTPException(
                     status_code=400,
-                    detail="LibreOffice 转换完成但未生成输出文件。"
-                    + hint
-                    + "也可以下载后用 Word/WPS 打开。"
+                    detail="LibreOffice 无法解析该文件（可能已损坏）。"
+                    "请下载后用 Word/WPS 打开，或另存为 .docx 后重新上传。"
                     + diag,
                 )
 
-        with open(out_path, "rb") as fh:
-            return fh.read()
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+            # 找到输出文件（LibreOffice 输出名 = 输入名去掉原扩展名 + 新扩展名）
+            out_name = f"source.{target_ext}"
+            out_path = os.path.join(work, out_name)
+            if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+                # LibreOffice 有时用原文件名（带扩展名）+ 新扩展名
+                alt_out_name = f"source.{ext or 'doc'}.{target_ext}"
+                alt_out_path = os.path.join(work, alt_out_name)
+                if os.path.isfile(alt_out_path) and os.path.getsize(alt_out_path) > 0:
+                    out_path = alt_out_path
+
+            if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+                if attempt > 0:
+                    # 首个候选目录失败、备用目录成功：典型的路径访问受限
+                    logger.warning(
+                        "[preview-text] 工作目录 %s 转换失败，已在备用目录 %s 成功"
+                        "（常见原因：AppArmor/snap 限制部署目录访问）",
+                        bases[0], base,
+                    )
+                with open(out_path, "rb") as fh:
+                    return fh.read()
+
+            # rc=0 但该目录下无输出：记录现场后尝试下一个候选目录
+            try:
+                last_in_size = os.path.getsize(in_path)
+            except OSError:
+                last_in_size = -1
+            logger.error(
+                "[preview-text] LibreOffice rc=%s 在工作目录 %s 未生成输出文件\n"
+                "源文件: %s（%d bytes）\nstdout: %s\nstderr: %s\n工作目录内容: %s",
+                result.returncode,
+                base,
+                in_path,
+                last_in_size,
+                stdout[:500],
+                stderr[:500],
+                os.listdir(work),
+            )
+            last_diag = _lo_diag(result.returncode, stdout, stderr)
+            last_combined = combined
+            last_rc = result.returncode
+            continue
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    # 所有候选目录都失败：汇总最有针对性的排查提示
+    missing_deps = _lo_missing_filter_deps(soffice, target_ext)
+    hint_parts: list[str] = []
+    if snap and "could not be loaded" in last_combined.lower():
+        # snap 沙箱（私有 /tmp、AppArmor）读不到后端给它的源文件
+        hint_parts.append(
+            "检测到服务器使用 snap 版 LibreOffice，其沙箱会导致无法读取源文件，"
+            "请在服务器执行：sudo snap remove libreoffice；"
+            "sudo apt-get update && sudo apt-get install -y libreoffice-writer，"
+            "然后重启服务。"
+        )
+    elif "could not be loaded" in last_combined.lower():
+        # 到这里时：源文件由后端同一用户刚写入（无属主权限问题）、
+        # 导入过滤器已预检存在、魔数确认是合法 OLE 文件、且已尝试 /tmp 等多个目录。
+        hint_parts.append(
+            "最常见原因是文件本身带密码加密或为 WPS 变体/已损坏格式"
+            "（LibreOffice 无头模式无法处理）。请下载该文件用 Word/WPS 打开验证，"
+            "或用 Word/WPS 另存为 .docx 后重新上传。"
+        )
+        hint_parts.append(
+            "若确认文件正常，请管理员在服务器执行 "
+            "“sudo aa-status | grep -i libre”检查 AppArmor 是否拦截，"
+            "以及 “sudo -u www-data soffice --headless --convert-to docx 某.doc”手动复现。"
+        )
+    if missing_deps:
+        pkg = {"docx": "libreoffice-writer", "xlsx": "libreoffice-calc"}.get(
+            target_ext, "libreoffice-writer",
+        )
+        hint_parts.append(
+            f"过滤器动态库缺少依赖（{'、'.join(missing_deps)}），"
+            f"请执行：sudo apt-get install -y --reinstall {pkg}。"
+        )
+    raise HTTPException(
+        status_code=400,
+        detail="LibreOffice 转换完成但未生成输出文件。"
+        + "".join(hint_parts)
+        + "也可以下载后用 Word/WPS 打开。"
+        + (last_diag or f"（诊断：rc={last_rc}，无错误输出）"),
+    )
 
 
 def _extract_text_from_bytes(raw: bytes, filename: str) -> tuple[str, str]:

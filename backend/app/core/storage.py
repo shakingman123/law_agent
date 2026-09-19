@@ -150,6 +150,7 @@ class StorageService:
                     object_name,
                     io.BytesIO(file_bytes),
                     length=size,
+                    content_type=_guess_media_type(object_name),
                 )
                 url = f"{self.URL_PREFIX}{object_name}"
                 logger.info("[storage][minio] upload_plain -> %s (%d bytes)", url, size)
@@ -292,7 +293,12 @@ class StorageService:
                 from fastapi import Header
 
                 content_length = resp.headers.get("Content-Length")
-                media_type = resp.headers.get("Content-Type", "application/octet-stream")
+                # 不能用 MinIO 存的 Content-Type：上传时若未指定，默认是
+                # application/octet-stream，浏览器 iframe 不会内联渲染 PDF/图片。
+                # 按对象扩展名强制推断，未知类型再回退 MinIO 返回值。
+                media_type = _guess_media_type(object_name)
+                if media_type == "application/octet-stream":
+                    media_type = resp.headers.get("Content-Type", "application/octet-stream")
 
                 logger.info("[storage][minio] serve <- %s", url)
                 return StreamingResponse(
