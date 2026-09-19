@@ -119,6 +119,27 @@ def _is_snap_soffice(soffice: str) -> bool:
     return real.startswith("/snap/") or real.startswith("/var/lib/snapd/")
 
 
+def _lo_has_import_filter(soffice: str, target_ext: str) -> bool:
+    """检查 LibreOffice 是否装有对应旧格式的导入过滤器。
+
+    最小化安装（只有 libreoffice-core）时 soffice 能启动、--version 正常，
+    但缺少 .doc 导入过滤器 libmswordlo.so（由 libreoffice-writer 包提供），
+    转换会报 rc=0 + "source file could not be loaded"，极具误导性。
+    过滤器动态库与 soffice 可执行文件位于同一 program 目录。
+    """
+    # 目标格式 → 该格式导入所需的过滤器库（Linux .so / Windows .dll）
+    # .ppt 的过滤器库名随版本不固定，不做预检（交给转换本身报错）
+    FILTER_LIBS = {
+        "docx": ("libmswordlo.so", "mswordlo.dll", "libmswordlo.dll"),  # .doc → 需 Writer
+        "xlsx": ("libscfiltlo.so", "scfiltlo.dll", "libscfiltlo.dll"),  # .xls → 需 Calc
+    }
+    libs = FILTER_LIBS.get(target_ext)
+    if not libs:
+        return True  # 未知目标格式不预检
+    prog_dir = os.path.dirname(os.path.realpath(soffice))
+    return any(os.path.isfile(os.path.join(prog_dir, lib)) for lib in libs)
+
+
 def _lo_work_dir(under_home: bool = False) -> str:
     """创建本次 LibreOffice 转换的独立工作目录并返回其绝对路径。
 
@@ -185,6 +206,21 @@ def _ole_to_docx(raw: bytes, filename: str) -> bytes:
             "“source file could not be loaded”，建议改装 deb 版："
             "sudo snap remove libreoffice && sudo apt-get install -y libreoffice-writer",
             soffice,
+        )
+
+    # 预检导入过滤器：最小化安装（只有 libreoffice-core）缺 libmswordlo.so 等，
+    # 会报极具误导性的 rc=0 + "source file could not be loaded"
+    if not _lo_has_import_filter(soffice, target_ext):
+        pkg = {"docx": "libreoffice-writer", "xlsx": "libreoffice-calc",
+               "pptx": "libreoffice-impress"}.get(target_ext, "libreoffice-writer")
+        logger.error(
+            "[preview-text] LibreOffice 缺少 %s 导入过滤器（%s 包未安装）", target_ext, pkg,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"服务器 LibreOffice 缺少处理该文件的组件，请管理员在服务器执行"
+            f"“sudo apt-get install -y {pkg}”后重启服务；"
+            "也可以下载后用 Word/WPS 打开。",
         )
 
     # 工作目录（源文件/输出/profile 都放这里）。不能用系统 /tmp，见 _lo_work_dir 说明
@@ -272,10 +308,16 @@ def _ole_to_docx(raw: bytes, filename: str) -> bytes:
             if os.path.isfile(alt_out_path) and os.path.getsize(alt_out_path) > 0:
                 out_path = alt_out_path
             else:
+                try:
+                    in_size = os.path.getsize(in_path)
+                except OSError:
+                    in_size = -1
                 logger.error(
                     "[preview-text] LibreOffice rc=%s 未生成输出文件\n"
-                    "stdout: %s\nstderr: %s\n工作目录内容: %s",
+                    "源文件: %s（%d bytes）\nstdout: %s\nstderr: %s\n工作目录内容: %s",
                     result.returncode,
+                    in_path,
+                    in_size,
                     stdout[:500],
                     stderr[:500],
                     os.listdir(work),
@@ -291,10 +333,14 @@ def _ole_to_docx(raw: bytes, filename: str) -> bytes:
                         "然后重启服务。"
                     )
                 elif "could not be loaded" in combined.lower():
+                    # 到这里时：源文件由后端同一用户刚写入（无权限问题）、
+                    # 导入过滤器已预检存在、魔数确认是合法 OLE 文件。
+                    # 无头模式下最常见的原因是文件带密码加密（加密 .doc 也是合法 OLE），
+                    # 其次是文件内容损坏/变体格式。
                     hint = (
-                        "LibreOffice 无法读取源文件，常见于工作目录权限不足或磁盘空间不足；"
-                        "可在服务器手动执行 `sudo -u <服务用户> soffice --headless "
-                        "--convert-to docx --outdir /tmp 某.doc` 复现排查。"
+                        "最常见原因是文件本身带密码加密（LibreOffice 无头模式无法处理），"
+                        "其次是文件内容损坏。请先下载该文件用 Word/WPS 打开验证："
+                        "若提示输入密码或打不开，则与服务器无关。"
                     )
                 raise HTTPException(
                     status_code=400,

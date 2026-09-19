@@ -29,6 +29,7 @@ from typing import Optional
 
 from fastapi import HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from app.core.config import settings
 from app.core.security import _fernet
@@ -217,7 +218,12 @@ class StorageService:
                 logger.info("[storage][minio] download <- %s", url)
                 return _decrypt_if_needed(raw, encrypted and decrypt)
             except Exception as e:  # noqa: BLE001
-                logger.debug("[storage] MinIO get 失败，尝试本地: %s", e)
+                logger.warning(
+                    "[storage] MinIO get 失败（bucket=%s key=%r），回退本地: %s",
+                    settings.MINIO_BUCKET,
+                    object_name,
+                    e,
+                )
 
         # 2. 本地磁盘
         local_path = os.path.join(self.local_root, object_name)
@@ -273,6 +279,7 @@ class StorageService:
                 content_length = resp.headers.get("Content-Length")
                 media_type = resp.headers.get("Content-Type", "application/octet-stream")
 
+                logger.info("[storage][minio] serve <- %s", url)
                 return StreamingResponse(
                     resp.stream(32 * 1024),
                     media_type=media_type,
@@ -280,10 +287,15 @@ class StorageService:
                         "Content-Disposition": f'inline; filename="{filename}"',
                         **({"Content-Length": content_length} if content_length else {}),
                     },
-                    background=lambda: resp.close(),
+                    background=BackgroundTask(resp.close),
                 )
             except Exception as e:  # noqa: BLE001
-                logger.debug("[storage] serve MinIO 失败，尝试本地: %s", e)
+                logger.warning(
+                    "[storage] serve MinIO 失败（bucket=%s key=%r），回退本地: %s",
+                    settings.MINIO_BUCKET,
+                    object_name,
+                    e,
+                )
 
         # 2. 本地文件
         local_path = os.path.join(self.local_root, object_name)
