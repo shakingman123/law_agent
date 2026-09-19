@@ -121,7 +121,7 @@ async def start_draft(
     """
     report = StageReport("start_draft")
     try:
-        graph = build_draft_graph(user, db, _report=report)
+        graph = await build_draft_graph(user, db, _report=report)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -173,7 +173,7 @@ async def resume_draft(
     """
     report = StageReport("resume_draft")
     try:
-        graph = build_draft_graph(user, db, _report=report)
+        graph = await build_draft_graph(user, db, _report=report)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

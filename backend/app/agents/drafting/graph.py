@@ -9,6 +9,7 @@ review 节点用 interrupt() 暂停，前端弹「文书预览 + 微调/确认�
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Optional, TypedDict
@@ -35,61 +36,78 @@ from app.agents.drafting.tools import (
 logger = logging.getLogger("app.agents.drafting")
 
 
-def _create_checkpointer():
-    """根据 CHECKPOINTER_TYPE 环境变量创建检查点保存器。
+# 共享检查点：跨请求保持图状态（resume 时能找到 thread_id）
+# 通过 CHECKPOINTER_TYPE 环境变量配置：memory(默认)/sqlite/postgres
+# 注意：图用 ainvoke 异步执行，检查点必须用 Async 版本（AsyncSqliteSaver/AsyncPostgresSaver），
+# 否则会报 "SqliteSaver does not support async methods"。
+_checkpointer = None
+_checkpointer_lock = asyncio.Lock()
+
+
+async def _get_checkpointer():
+    """惰性创建并缓存检查点保存器（异步版本，配合 ainvoke 使用）。
 
     - memory: MemorySaver（默认，开发环境，进程内存，重启后丢失）
-    - sqlite: SqliteSaver（本地文件持久化，适合单机部署）
-    - postgres: PostgresSaver（生产环境，多实例共享，自动建表）
+    - sqlite: AsyncSqliteSaver（本地文件持久化，适合单机部署，需 aiosqlite）
+    - postgres: AsyncPostgresSaver（生产环境，多实例共享，需 asyncpg）
 
     任意类型初始化失败时自动回退 MemorySaver，保证服务可用。
     """
-    cp_type = settings.CHECKPOINTER_TYPE.lower().strip()
+    global _checkpointer
+    if _checkpointer is not None:
+        return _checkpointer
 
-    if cp_type == "postgres":
-        try:
-            from langgraph.checkpoint.postgres import PostgresSaver
+    async with _checkpointer_lock:
+        if _checkpointer is not None:
+            return _checkpointer
 
-            pg_url = settings.CHECKPOINTER_PG_URL or settings.DATABASE_URL
-            if not pg_url.startswith("postgresql"):
-                logger.warning(
-                    "[checkpointer] 连接串非 PostgreSQL（%s...），回退 MemorySaver",
-                    pg_url[:50],
-                )
-                return MemorySaver()
-            checkpointer = PostgresSaver.from_conn_string(pg_url)
-            # setup() 创建检查点表（幂等，已存在则跳过）
-            checkpointer.setup()
-            logger.info("[checkpointer] 使用 PostgresSaver 持久化检查点")
-            return checkpointer
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[checkpointer] PostgresSaver 初始化失败，回退 MemorySaver: %s", e)
-            return MemorySaver()
+        cp_type = settings.CHECKPOINTER_TYPE.lower().strip()
 
-    if cp_type == "sqlite":
-        try:
-            import sqlite3
+        if cp_type == "postgres":
+            try:
+                from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-            from langgraph.checkpoint.sqlite import SqliteSaver
+                pg_url = settings.CHECKPOINTER_PG_URL or settings.DATABASE_URL
+                if not pg_url.startswith("postgresql"):
+                    logger.warning(
+                        "[checkpointer] 连接串非 PostgreSQL（%s...），回退 MemorySaver",
+                        pg_url[:50],
+                    )
+                    _checkpointer = MemorySaver()
+                    return _checkpointer
+                # from_conn_string 返回异步上下文管理器，手动 enter 保持长连接
+                ctx = AsyncPostgresSaver.from_conn_string(pg_url)
+                saver = await ctx.__aenter__()
+                saver._ctx = ctx  # 保持引用防止 GC 提前关闭连接
+                _checkpointer = saver
+                logger.info("[checkpointer] 使用 AsyncPostgresSaver 持久化检查点")
+                return saver
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[checkpointer] AsyncPostgresSaver 初始化失败，回退 MemorySaver: %s", e)
+                _checkpointer = MemorySaver()
+                return _checkpointer
 
-            db_path = settings.CHECKPOINTER_SQLITE_PATH
-            conn = sqlite3.connect(db_path, check_same_thread=False)
-            checkpointer = SqliteSaver(conn)
-            checkpointer.setup()
-            logger.info("[checkpointer] 使用 SqliteSaver 持久化检查点: %s", db_path)
-            return checkpointer
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[checkpointer] SqliteSaver 初始化失败，回退 MemorySaver: %s", e)
-            return MemorySaver()
+        if cp_type == "sqlite":
+            try:
+                import aiosqlite
+                from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-    # 默认 memory
-    logger.info("[checkpointer] 使用 MemorySaver（内存检查点，重启后丢失）")
-    return MemorySaver()
+                db_path = settings.CHECKPOINTER_SQLITE_PATH
+                conn = await aiosqlite.connect(db_path)
+                saver = AsyncSqliteSaver(conn)
+                await saver.setup()
+                _checkpointer = saver
+                logger.info("[checkpointer] 使用 AsyncSqliteSaver 持久化检查点: %s", db_path)
+                return saver
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[checkpointer] AsyncSqliteSaver 初始化失败，回退 MemorySaver: %s", e)
+                _checkpointer = MemorySaver()
+                return _checkpointer
 
-
-# 共享检查点：跨请求保持图状态（resume 时能找到 thread_id）
-# 通过 CHECKPOINTER_TYPE 环境变量配置：memory(默认)/sqlite/postgres
-SHARED_CHECKPOINTER = _create_checkpointer()
+        # 默认 memory
+        logger.info("[checkpointer] 使用 MemorySaver（内存检查点，重启后丢失）")
+        _checkpointer = MemorySaver()
+        return _checkpointer
 
 
 # 案件字段 → 模板占位符的映射
@@ -125,7 +143,7 @@ class DraftState(TypedDict, total=False):
     error: str
 
 
-def build_draft_graph(user: User, db: Session, _report=None):
+async def build_draft_graph(user: User, db: Session, _report=None):
     """构造编译好的文书撰写图。
 
     每次对话请求构造一个图实例，节点闭包捕获 user/db，
@@ -466,4 +484,5 @@ def build_draft_graph(user: User, db: Session, _report=None):
     builder.add_edge("finalize", END)
 
     logger.info("[build_draft_graph] 图编译完成: user_id=%s", user.id)
-    return builder.compile(checkpointer=SHARED_CHECKPOINTER, interrupt_before=["review"])
+    checkpointer = await _get_checkpointer()
+    return builder.compile(checkpointer=checkpointer, interrupt_before=["review"])

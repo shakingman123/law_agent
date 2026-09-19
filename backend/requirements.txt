@@ -17,6 +17,9 @@ langchain-text-splitters
 # LangGraph 检查点持久化（按 CHECKPOINTER_TYPE 选择安装）
 langgraph-checkpoint-sqlite
 langgraph-checkpoint-postgres
+# 异步检查点驱动（AsyncSqliteSaver / AsyncPostgresSaver 需要，配合 ainvoke）
+aiosqlite
+asyncpg
 # RAG 知识库（本地向量库 + 文档解析）
 chromadb
 python-docx
