@@ -89,10 +89,11 @@ def _build_system_content(db: Session, context_block: str) -> str:
     return sys_tpl.replace("{{context}}", context_block)
 
 
-def _build_response(thread_id: str, state: dict, graph, config) -> DraftResponse:
+async def _build_response(thread_id: str, state: dict, graph, config) -> DraftResponse:
     """根据图执行后的状态构造响应。"""
     # 是否仍在 interrupt 暂停（next 非空表示有节点等待执行）
-    state_obj = graph.get_state(config)
+    # AsyncSqliteSaver 只支持异步接口，必须用 aget_state
+    state_obj = await graph.aget_state(config)
     awaiting = bool(state_obj.next)
 
     return DraftResponse(
@@ -155,7 +156,7 @@ async def start_draft(
         result.get("error", ""),
     )
 
-    return _build_response(thread_id, result, graph, config)
+    return await _build_response(thread_id, result, graph, config)
 
 
 @router.post("/draft/{thread_id}/resume", response_model=DraftResponse)
@@ -180,12 +181,13 @@ async def resume_draft(
     config = {"configurable": {"thread_id": thread_id}}
 
     # 校验该 thread 确实存在且仍在等待（next 含 review）
-    state_obj = graph.get_state(config)
+    # AsyncSqliteSaver 只支持异步接口
+    state_obj = await graph.aget_state(config)
     if not state_obj or not state_obj.next:
         raise HTTPException(status_code=404, detail="会话不存在或已结束")
 
     # 写入用户决策到状态
-    graph.update_state(
+    await graph.aupdate_state(
         config,
         {"confirmed": payload.confirmed, "user_feedback": payload.feedback or ""},
     )
@@ -198,7 +200,7 @@ async def resume_draft(
         raise HTTPException(status_code=500, detail=f"恢复执行失败：{e}")
 
     report.finish(extra=f"草稿长度={len(result.get('draft', '') or '')}")
-    return _build_response(thread_id, result, graph, config)
+    return await _build_response(thread_id, result, graph, config)
 
 
 @router.post("/message", response_model=ChatMessageResponse)
